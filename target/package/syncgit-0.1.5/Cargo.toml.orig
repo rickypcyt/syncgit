@@ -1,0 +1,19 @@
+[package]
+name = "syncgit"
+version = "0.1.5"
+edition = "2021"
+authors = ["Rickypcyt <rickypcyt@gmail.com>"]
+description = "Una herramienta CLI para sincronizar repositorios Git"
+readme = "README.md"
+license = "MIT"
+exclude = ["target/*"]
+
+[dependencies]
+term_size = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
