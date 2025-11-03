@@ -1,0 +1,22 @@
+# Carpetas generadas por Cargo (el sistema de compilación y gestión de paquetes de Rust)
+target/
+**/target/
+
+# Archivos de lock de Cargo (estos en general se versionan, pero si quieres ignorarlos)
+Cargo.lock
+
+# Archivos temporales y de backup del editor
+*.rs.bk
+*.swp
+*~
+
+# Archivos de sistema o editor
+.DS_Store
+.idea/
+.vscode/
+
+# Carpetas para dependencias descargadas (si las usas en submódulos, mejor ignorar)
+**/node_modules/
+
+# Logs y otros archivos temporales
+*.log
