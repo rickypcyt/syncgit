@@ -1,5 +1,0 @@
-cuando vayas a subir es
-primero poner syncgit hacer push
-luego haces cargo publish
-luego haces cargo install syncgit
-ahi ya lo tienes en todos lados
