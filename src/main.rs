@@ -155,9 +155,9 @@ impl GitRepo {
             .unwrap_or((0, 0))
     }
 
-    /// Normaliza un pathspec para evitar inyección de comandos
+    /// Normalizes a pathspec to prevent command injection
     fn normalize_pathspec(path: &str) -> String {
-        // Eliminar caracteres de nueva línea y retorno de carro
+        // Remove newline and carriage return characters
         let clean = path.replace('\\', "/")  // Normalizar separadores
                       .replace("\n", "")
                       .replace("\r", "");
@@ -167,7 +167,7 @@ impl GitRepo {
     }
 
     fn has_changes(&self, pathspec: Option<&str>) -> bool {
-        // Verificar primero si el repositorio es válido
+        // First check if the repository is valid
         if !self.root.exists() {
             return false;
         }
@@ -185,7 +185,7 @@ impl GitRepo {
             }
         }
 
-        // Usar Command directamente para tener más control sobre la ejecución
+        // Use Command directly for more control over execution
         match Command::new("git")
             .arg("-C")
             .arg(&self.root)
@@ -209,7 +209,7 @@ impl GitRepo {
     }
 
     fn run_command(&self, args: &[&str]) -> Result<()> {
-        // Verificar que el directorio raíz existe
+        // Verify that the root directory exists
         if !self.root.exists() {
             return Err(GitError::CommandFailed(format!(
                 "Repository root directory does not exist: {}",
@@ -322,10 +322,10 @@ impl GitRepo {
             .ok_or_else(|| GitError::CommandFailed("Failed to get remote URL".to_string()))?;
 
         if remote_url.starts_with("https://") {
-            // Configurar el helper de credenciales para almacenar en memoria (cache)
+            // Configure the credentials helper to store in memory (cache)
             self.run_command(&["config", "--local", "credential.helper", "cache"])?;
             
-            // Configurar el tiempo de caché (por defecto 15 minutos)
+            // Configure cache timeout (default 15 minutes)
             self.run_command(&["config", "--local", "credential.helper", "cache --timeout=3600"])?;
             
             // Configurar la URL remota sin credenciales
@@ -529,7 +529,7 @@ fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
     }
 
     // Stage changes
-    // Usar -- para prevenir que pathspec sea interpretado como opción
+    // Use -- to prevent pathspec from being interpreted as an option
     println!("\n{}", UI::center_text("⏳ Staging changes..."));
     repo.run_command(&["add", "--", pathspec])?;
     println!("{}", UI::center_text("✅ Changes added"));
@@ -575,7 +575,7 @@ fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
         return Err(GitError::NoCommitMessage);
     }
 
-    // Usar -- para prevenir que el mensaje sea interpretado como opción
+    // Use -- to prevent the message from being interpreted as an option
     repo.run_command(&["commit", "-m", &message, "--"])?;
     UI::print_separator();
     
@@ -583,7 +583,7 @@ fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
 }
 
 fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
-    // Verificar conflictos de merge
+    // Check for merge conflicts
     let has_conflicts = Command::new("git")
         .arg("-C").arg(&repo.root)
         .args(&["diff", "--name-only", "--diff-filter=U"])
@@ -593,11 +593,11 @@ fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
 
     if has_conflicts {
         return Err(GitError::CommandFailed(
-            "Tienes conflictos sin resolver. Por favor, resuélvelos antes de continuar.".into()
+"You have unresolved conflicts. Please resolve them before continuing.".into()
         ));
     }
 
-    // Verificar si hay un merge en progreso
+    // Check if there's a merge in progress
     let merge_head_exists = repo.root.join(".git/MERGE_HEAD").exists();
     if merge_head_exists {
         return Err(GitError::CommandFailed(
@@ -614,9 +614,9 @@ fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
         .map_err(|e| GitError::CommandFailed(format!("Failed to check for stashed changes: {}", e)))?;
 
     if has_stash {
-        println!("{}", UI::center_text("⚠️  Advertencia: Tienes cambios guardados en stash"));
-        if !UI::prompt_yes_no("¿Deseas continuar de todos modos?") {
-            return Err(GitError::CommandFailed("Operación cancelada por el usuario".into()));
+        println!("{}", UI::center_text("⚠️  Warning: You have stashed changes"));
+        if !UI::prompt_yes_no("Do you want to continue anyway?") {
+            return Err(GitError::CommandFailed("Operation cancelled by user".into()));
         }
     }
 
@@ -626,7 +626,7 @@ fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
 fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
     // First check for any conflicts or problematic states
     if let Err(e) = check_git_conflicts(repo) {
-        println!("\n{}", UI::center_text("❌ Verification error:"));
+        println!("\n{}", UI::center_text(" Verification error:"));
         println!("{}\n", UI::center_text(&e.to_string()));
         return Err(e);
     }
@@ -634,12 +634,12 @@ fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
     let (ahead, _) = repo.get_ahead_behind_count();
     
     if ahead == 0 {
-        println!("{}", UI::center_text("✅ No pending commits to push"));
+        println!("{}", UI::center_text(" No pending commits to push"));
         UI::print_separator();
         return Ok(());
     }
 
-    println!("{}", UI::center_text("⚠️  WARNING: You have commits that need to be pushed"));
+    println!("{}", UI::center_text(" WARNING: You have commits that need to be pushed"));
     println!("{}", UI::center_text(&format!("   {} commits ahead of remote repository", ahead)));
     println!("{}", UI::center_text("   This could cause conflicts or duplicate commits."));
     UI::print_separator();
@@ -650,11 +650,11 @@ fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}", UI::center_text("⬆️  Subiendo commits existentes..."));
+    println!("{}", UI::center_text("⬆️  Pushing existing commits..."));
     
     if get_github_token().is_none() {
-        println!("{}", UI::center_text("❌ No se puede subir: No se encontró el token de GitHub"));
-        println!("{}", UI::center_text("   Por favor configura tu token de GitHub"));
+        println!("{}", UI::center_text("❌ Cannot push: GitHub token not found"));
+        println!("{}", UI::center_text("   Please configure your GitHub token"));
         return Err(GitError::NoToken);
     }
     
@@ -665,7 +665,7 @@ fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
     }
 
     repo.configure_auth_remote()?;
-    // Asegurarse de que push no reciba parámetros no deseados
+    // Ensure push doesn't receive any unwanted parameters
     repo.run_command(&["push", "--"])?;
     
     println!("{}", UI::center_text("✅ Existing commits pushed successfully!"));
@@ -878,8 +878,16 @@ fn main() {
         return;
     }
 
-    // Push
-    println!("{}", UI::center_text("⬆️  Pushing changes..."));
+    // Ask for confirmation before pushing
+    println!("\n{}", UI::center_text("⚠️  You're about to push your changes to the remote repository."));
+    println!("{}", UI::center_text("   Press Enter to confirm push, or Ctrl+C to cancel"));
+    
+    if !UI::wait_for_enter() {
+        println!("\n{}", UI::center_text("❌ Push cancelled"));
+        return;
+    }
+    
+    println!("\n{}", UI::center_text("⬆️  Pushing changes..."));
     
     if !check_internet_connection() {
         println!("{}", UI::center_text(MSG_NO_INTERNET_PUSH));
@@ -891,6 +899,9 @@ fn main() {
         return;
     }
 
-    // Asegurarse de que push no reciba parámetros no deseados
-    let _ = repo.run_command(&["push", "--"]);
+    // Ensure push doesn't receive any unwanted parameters
+    match repo.run_command(&["push", "--"]) {
+        Ok(_) => println!("\n{}", UI::center_text("✅ Changes pushed successfully!")),
+        Err(e) => println!("\n{}: {}", UI::center_text("❌ Error pushing changes"), e),
+    }
 }
