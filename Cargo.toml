@@ -1,9 +1,9 @@
 [package]
 name = "syncgit"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 authors = ["Rickypcyt <rickypcyt@gmail.com>"]
-description = "Una herramienta CLI para sincronizar repositorios Git"
+description = "CLI tool to sync git repositories."
 readme = "README.md"
 license = "MIT"
 exclude = ["target/*"]

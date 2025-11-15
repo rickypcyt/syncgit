@@ -1,58 +1,73 @@
 ---
-# 🛠️ syncgit — Git Sync CLI
+# 🛠️ syncgit — Git Sync CLI (v0.2.0)
 
-A lightweight Rust-based CLI to streamline everyday Git flows: detect the repo root, show a clear status, stage only what you need, commit, and push — with a clean, user-friendly terminal UI.
+A lightweight Rust-based CLI to streamline everyday Git workflows with enhanced safety and user experience. Automatically detects repository context, provides clear status, and guides you through the commit and sync process with intuitive prompts.
+
+## 🚀 What's New in v0.2.0
+
+- 🛡️ **Safer Push Workflow**: Added explicit confirmation before pushing changes
+- 🔄 **Improved Sync**: Better handling of remote changes with clear prompts
+- 🌍 **Fully Internationalized**: All user-facing messages now in English
+- 🎯 **More Precise**: Better detection of repository state and changes
+- 🛠️ **Bug Fixes**: Various stability improvements and edge case handling
 
 ## 📋 Features
 
-- 🔍 Auto-detects the repository root (`.git`).
-- 🧭 Shows a minimal header: `Repository root` and `Subpath` (relative path from the repo root).
-- ✅ Global short status (`git status -sb`).
-- 📄 Subpath-only view grouped by folder (pretty-printed `--porcelain` limited to the current subpath).
-- ➕ Stages changes only within the current subpath.
-- ⏸️ Pause to review: “Press Enter to commit changes…” before asking the commit message.
-- ✏️ Commit message prompt, then push.
-- ⚠️ Pending pushes detection to avoid duplicate histories.
-- 🌐 Offline-friendly: commits locally, defers push with a clear message.
-- 🔐 Optional GitHub token (`GITHUB_TOKEN`) to push to private repos via HTTPS.
-- 🧭 Works from repo root or any subfolder. If not in a repo, lists child repos.
+- 🔍 Auto-detects the repository root (`.git`)
+- 🧭 Context-aware: Shows repository root and current subpath
+- 📊 Clear status overview with color-coded output
+- 📂 Subpath-aware operations for precise changes
+- ⏯️ Interactive workflow with clear prompts at each step
+- 🔄 Smart sync that handles both push and pull scenarios
+- 🔒 Secure credential handling with GitHub token support
+- 🌐 Offline-friendly with clear status indicators
+- 🧭 Works from any subdirectory within a repository
 
 All path-sensitive `git` operations use `git -C <repo_root>` for robust behavior regardless of where you run `syncgit`.
 
-## 🧱 Requirements
+## 🛠️ Installation
 
-- [Rust](https://www.rust-lang.org/tools/install)
-- Git installed and configured.
-- (Optional) Set a GitHub token as an environment variable for private repositories:
+### Prerequisites
 
-```
-export GITHUB_TOKEN=your_token_here
-```
+- [Rust](https://www.rust-lang.org/tools/install) (latest stable version recommended)
+- Git 2.0 or later
 
-## 🚀 Installation
+### Install from crates.io
 
-Install Rust if you don’t have it yet:
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then install the CLI globally:
-
-```sh
+```bash
 cargo install syncgit
 ```
 
+### Build from source
 
-## 🧪 Usage
+```bash
+git clone https://github.com/yourusername/syncgit.git
+cd syncgit
+cargo install --path .
+```
 
-Run the tool from anywhere inside a Git repository:
+### GitHub Token (for private repositories)
 
-```sh
+To work with private repositories, set your GitHub token:
+
+```bash
+export GITHUB_TOKEN=your_github_token_here
+# Add to your shell's rc file to make it persistent
+```
+
+## 🚀 Basic Usage
+
+Run the tool from any directory within a Git repository:
+
+```bash
 syncgit
 ```
 
-### Typical flow
+The tool will guide you through:
+1. Reviewing changes
+2. Staging files
+3. Committing with a message
+4. Syncing with remote (if needed)
 
 1) Info header: `Repository root` and `Subpath`.
 2) Global short status.
