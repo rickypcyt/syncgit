@@ -208,6 +208,30 @@ impl GitRepo {
         }
     }
 
+    fn run_command_with_output(&self, args: &[&str]) -> Result<String> {
+        // Same as run_command but returns the command's output
+        let output = self.create_command(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| GitError::CommandFailed(format!("Failed to execute git command: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::CommandFailed(format!(
+                "git command failed with status {}: {}\nError: {}",
+                output.status,
+                args.join(" "),
+                stderr
+            )));
+        }
+
+        String::from_utf8(output.stdout)
+            .map_err(|e| GitError::CommandFailed(format!("Failed to parse command output: {}", e)))
+            .map(|s| s.trim().to_string())
+    }
+
     fn run_command(&self, args: &[&str]) -> Result<()> {
         // Verify that the root directory exists
         if !self.root.exists() {
@@ -770,16 +794,21 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
             // First fetch the latest changes
             repo.run_command(&["fetch", "origin"])?;
             
-            // Get current branch name
-            let branch = repo.get_branch();
+            // Stash any local changes temporarily
+            let has_stash = repo.run_command(&["stash", "push", "--include-untracked"]).is_ok();
             
-            // Pull with rebase and autostash to handle local changes
-            repo.run_command(&["pull", "--rebase", "--autostash", "origin", &branch])?;
+            // Get current branch's upstream
+            let upstream = match repo.run_command_with_output(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
+                Ok(upstream) => upstream,
+                Err(_) => "origin/main".to_string()
+            };
             
-            // Push any local changes that were rebased on top
-            if ahead > 0 {
-                println!("Pushing local changes after sync...");
-                repo.run_command(&["push", "origin", &branch])?;
+            // Reset to match the upstream branch
+            repo.run_command(&["reset", "--hard", &upstream])?;
+            
+            // If we had stashed changes, apply them back
+            if has_stash {
+                repo.run_command(&["stash", "pop"])?;
             }
             
             println!("✅ Successfully synced with remote!");
