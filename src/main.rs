@@ -4,593 +4,838 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::net::TcpStream;
 use std::fs;
+use std::collections::BTreeMap;
+use std::time::Duration;
 
-// Terminal sizing only
 use crossterm::terminal;
 
-// Reused messages
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
 const MSG_NO_INTERNET_PUSH: &str = "⚠️  No internet connection. Changes have been saved locally but not pushed.";
 const MSG_RUN_PUSH_MANUALLY: &str = "    Please run 'git push' manually when you have connection.";
 
-fn find_git_root(mut dir: PathBuf) -> Option<PathBuf> {
-    loop {
-        if dir.join(".git").is_dir() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+const TOKEN_ENV_VARS: &[&str] = &["GITHUB_TOKEN", "GH_TOKEN", "GIT_TOKEN"];
+const INTERNET_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+use std::fmt;
+
+#[derive(Debug)]
+enum GitError {
+    NoChanges,
+    NoCommitMessage,
+    CommandFailed(String),
+    NoToken,
+    NoInternet,
+    #[allow(dead_code)]
+    Other(String),
 }
 
-/// Stage and commit changes limited to the provided pathspec.
-/// Shows grouped status, stages changes, confirms staged diff exists, and prompts for commit message.
-/// Returns true if commit was created; false to abort the flow.
-fn stage_and_commit_current_pathspec(repo_path: &Path, pathspec: &str) -> bool {
-    // Show grouped concise status for the current subpath
-    print_separator();
-    println!("{}", center_text("📄 Changes limited to current subpath:"));
-    print_grouped_status(repo_path, pathspec);
+type Result<T> = std::result::Result<T, GitError>;
 
-    // Check if there are any changes in current pathspec
-    let has_unstaged_in_current = !Command::new("git")
-        .arg("-C").arg(repo_path)
-        .args(&["diff", "--quiet", "--", pathspec])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+// ============================================================================
+// GIT OPERATIONS
+// ============================================================================
 
-    let has_staged_in_current = !Command::new("git")
-        .arg("-C").arg(repo_path)
-        .args(&["diff", "--cached", "--quiet", "--", pathspec])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    let has_untracked_in_current = !Command::new("git")
-        .arg("-C").arg(repo_path)
-        .args(&["ls-files", "--others", "--exclude-standard", "--", pathspec])
-        .output()
-        .map(|o| o.stdout.is_empty())
-        .unwrap_or(true);
-
-    let has_changes_in_current = has_unstaged_in_current || has_staged_in_current || !has_untracked_in_current;
-
-    if has_changes_in_current {
-        // Stage only within the current directory
-        if run("git", &["-C", &repo_path.to_string_lossy(), "add", pathspec]) {
-            println!("{}", center_text("✅ Changes added"));
-        } else {
-            return false;
-        }
-    } else {
-        println!("{}", center_text("🟢 No changes to add in the current folder"));
-        return false;
-    }
-
-    // Ensure there are staged changes to commit (only in the current folder)
-    let has_staged_changes = !Command::new("git")
-        .arg("-C").arg(repo_path)
-        .args(&["diff", "--cached", "--quiet", "--", pathspec])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !has_staged_changes {
-        println!("{}", center_text("ℹ️  There's nothing to commit"));
-        println!("{}", center_text("   All changes are already committed"));
-        return false;
-    }
-
-    print_separator();
-    print!("✏️  Enter commit message: ");
-    io::stdout().flush().unwrap();
-    let mut message = String::new();
-    io::stdin().read_line(&mut message).unwrap();
-    let message = message.trim();
-
-    if message.is_empty() {
-        println!("{}", center_text("ℹ️  No commit message provided, skipping commit"));
-        return false;
-    }
-
-    if !run("git", &["-C", &repo_path.to_string_lossy(), "commit", "-m", message]) {
-        return false;
-    }
-    print_separator();
-    true
+struct GitRepo {
+    root: PathBuf,
+    name: String,
 }
 
-fn get_github_token() -> Option<String> {
-    // Check multiple possible environment variable names for GitHub token
-    for var_name in &["GITHUB_TOKEN", "GH_TOKEN", "GIT_TOKEN"] {
-        if let Ok(token) = env::var(var_name) {
-            if !token.trim().is_empty() {
-                return Some(token);
+impl GitRepo {
+    fn find_from_current_dir() -> Option<Self> {
+        let current = env::current_dir().ok()?;
+        Self::find_from_path(current)
+    }
+
+    fn find_from_path(mut path: PathBuf) -> Option<Self> {
+        loop {
+            if path.join(".git").is_dir() {
+                let name = Self::extract_repo_name(&path);
+                return Some(GitRepo { root: path, name });
+            }
+            if !path.pop() {
+                return None;
             }
         }
     }
-    None
-}
 
-fn check_internet_connection() -> bool {
-    TcpStream::connect("8.8.8.8:53").is_ok()
-}
-
-fn center_text(text: &str) -> String {
-    let (width, _) = terminal::size().unwrap_or((80, 24));
-    let padding = ((width as usize).saturating_sub(text.len())) / 2;
-    format!("{}{}", " ".repeat(padding), text)
-}
-
-// Helper: create a rectangle centered within area `r` using percentages of the size
-// TUI helpers removed
-
-fn print_separator() {
-    let (width, _) = terminal::size().unwrap_or((80, 24));
-    println!("{}", "─".repeat(width as usize));
-}
-
-fn run(cmd: &str, args: &[&str]) -> bool {
-    let mut command = Command::new(cmd);
-    if cmd == "git" {
-        if let Some(token) = get_github_token() {
-            command.env("GITHUB_TOKEN", token);
+    fn extract_repo_name(path: &Path) -> String {
+        // Try remote URL first
+        if let Some(url) = Self::get_remote_url(path) {
+            if let Some(name) = Self::parse_repo_name_from_url(&url) {
+                return name;
+            }
         }
-    }
-    let status = command.args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-
-    matches!(status, Ok(s) if s.success())
-}
-
-fn get_ahead_count(path: &Path) -> i32 {
-    // Verificar si hay un upstream configurado
-    let upstream = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-
-    if upstream.is_none() {
-        return 0;
+        
+        // Fallback to directory name
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
+            .to_string_lossy()
+            .to_string()
     }
 
-    // Obtener el nombre de la rama actual
-    let branch = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["symbolic-ref", "--short", "HEAD"])
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or("(no branch)".to_string());
-
-    let branch = branch.trim();
-    let up = upstream.as_ref().unwrap().trim();
-
-    // Contar commits ahead del remoto
-    let count = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["rev-list", "--left-right", "--count", &format!("{}...{}", branch, up)])
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or("0 0".to_string());
-
-    let parts: Vec<&str> = count.trim().split_whitespace().collect();
-    if parts.len() == 2 {
-        parts[1].parse().unwrap_or(0)
-    } else {
-        0
-    }
-}
-
-fn check_pending_push(path: &Path) -> bool {
-    get_ahead_count(path) > 0
-}
-
-/// Compute the pathspec relative to the repo root for the current directory.
-fn compute_pathspec(repo_path: &Path, current: &Path) -> String {
-    let rel = current
-        .strip_prefix(repo_path)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if rel.is_empty() { ".".to_string() } else { rel }
-}
-
-/// Print the current subpath relative to the repo root.
-fn show_subpath_info(repo_path: &Path, current: &Path) {
-    let pathspec = compute_pathspec(repo_path, current);
-    if pathspec == "." {
-        println!("{}", center_text("🧭 Subpath: . (repo root)"));
-    } else {
-        println!("{}", center_text(&format!("🧭 Subpath: {}", pathspec)));
-    }
-}
-
-/// Configure remote URL with token (if present) to allow https `git push` with auth.
-/// Returns true if OK or if there is no token; false if it fails.
-fn configure_auth_remote(repo_path: &Path) -> bool {
-    match get_github_token() {
-        Some(token) => {
-            println!("🔑 Found GitHub token");
+    fn get_remote_url(path: &Path) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("config")
+            .arg("--get")
+            .arg("remote.origin.url")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string());
             
-            // Get the current remote URL
-            let remote_url = match Command::new("git")
-                .arg("-C").arg(repo_path)
-                .args(&["config", "--get", "remote.origin.url"]) 
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                },
-                _ => {
-                    eprintln!("❌ Failed to get remote URL");
+        if let Some(ref url) = output {
+            if url.is_empty() {
+                return None;
+            }
+        }
+        output
+    }
+
+    fn parse_repo_name_from_url(url: &str) -> Option<String> {
+        let url = url.trim_end_matches(".git");
+        url.rfind('/')
+            .and_then(|idx| {
+                let name = &url[idx + 1..];
+                if name.is_empty() { None } else { Some(name.to_string()) }
+            })
+    }
+
+    fn get_branch(&self) -> String {
+        self.run_command(&["symbolic-ref", "--short", "HEAD"])
+            .map(|_| String::new())
+            .unwrap_or_else(|e| {
+                eprintln!("Error getting branch: {}", e);
+                "unknown".to_string()
+            })
+    }
+
+    fn has_upstream(&self) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .arg("rev-parse")
+            .arg("--abbrev-ref")
+            .arg("--symbolic-full-name")
+            .arg("@{u}")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn get_ahead_behind_count(&self) -> (usize, usize) {
+        if !self.has_upstream() {
+            return (0, 0);
+        }
+
+        let branch = self.get_branch();
+        let upstream = format!("{}@{{u}}", branch);
+
+        Command::new("git")
+            .arg("-C").arg(&self.root)
+            .args(&["rev-list", "--left-right", "--count", &format!("{}...{}", branch, upstream)])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let parts: Vec<&str> = s.trim().split_whitespace().collect();
+                if parts.len() == 2 {
+                    let behind = parts[0].parse().ok()?;
+                    let ahead = parts[1].parse().ok()?;
+                    Some((ahead, behind))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// Normaliza un pathspec para evitar inyección de comandos
+    fn normalize_pathspec(path: &str) -> String {
+        // Eliminar caracteres de nueva línea y retorno de carro
+        let clean = path.replace('\\', "/")  // Normalizar separadores
+                      .replace("\n", "")
+                      .replace("\r", "");
+        
+        // Eliminar referencias a .git para evitar escapes de directorio
+        clean.replace("/.git/", "/GIT_ESCAPED/")
+    }
+
+    fn has_changes(&self, pathspec: Option<&str>) -> bool {
+        // Verificar primero si el repositorio es válido
+        if !self.root.exists() {
+            return false;
+        }
+
+        let mut args = vec!["status", "--porcelain=v1", "-z"];
+        
+        // Procesar el pathspec si existe
+        let normalized = pathspec.map(|p| Self::normalize_pathspec(p));
+        
+        if let Some(ref norm_path) = normalized {
+            if !norm_path.is_empty() {
+                // Usar -z para manejar correctamente espacios en nombres de archivo
+                args.push("--");
+                args.push(norm_path);
+            }
+        }
+
+        // Usar Command directamente para tener más control sobre la ejecución
+        match Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(&args)
+            .output() 
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    eprintln!("Error al verificar cambios: {}", 
+                        String::from_utf8_lossy(&output.stderr));
                     return false;
                 }
-            };
-
-            // Only modify the URL if it's an HTTPS URL and doesn't already contain a token
-            if remote_url.starts_with("https://") && !remote_url.contains('@') {
-                let auth_url = format!("https://{}@{}", token, &remote_url[8..]);
-                if run("git", &["-C", &repo_path.to_string_lossy(), "remote", "set-url", "origin", &auth_url]) {
-                    println!("✅ Configured remote with authentication");
-                    true
-                } else {
-                    eprintln!("❌ Failed to update remote URL");
-                    false
-                }
-            } else if remote_url.starts_with("git@") {
-                println!("ℹ️  Using SSH authentication (no token needed)");
-                true
-            } else {
-                println!("ℹ️  Remote URL doesn't appear to be an HTTPS URL or already has authentication");
-                true
+                // Verificar si hay salida (cambios)
+                !output.stdout.is_empty()
+            },
+            Err(e) => {
+                eprintln!("Error al ejecutar git status: {}", e);
+                false
             }
-        },
-        None => {
-            println!("ℹ️  No GitHub token found in environment variables");
-            println!("   Tried: GITHUB_TOKEN, GH_TOKEN, GIT_TOKEN");
-            true
-        }
-    }
-}
-
-/// Show repository short status (equivalent to `git status -sb`).
-fn show_repo_status(repo_path: &Path) -> bool {
-    println!("{}", center_text("🔍 Repository status:"));
-    let ok = run("git", &["-C", &repo_path.to_string_lossy(), "status", "-sb"]);
-    ok
-}
-
-/// Run `git pull` and print a header.
-fn run_git_pull(repo_path: &Path) -> bool {
-    println!("{}", center_text("⬇️  Pulling changes..."));
-    if !run("git", &["-C", &repo_path.to_string_lossy(), "pull"]) { return false; }
-    true
-}
-
-/// Handle interactive flow when there are pending pushes.
-/// Returns false if the process should abort (e.g., user cannot push or chooses to stop), true to continue.
-fn handle_pending_pushes(repo_path: &Path) -> bool {
-    // Show detailed info about ahead commits
-    let ahead_count = get_ahead_count(repo_path);
-    println!("{}", center_text("⚠️  WARNING: You have commits that need to be pushed!"));
-    println!("{}", center_text(&format!("   {} commits ahead of remote repository", ahead_count)));
-    println!("{}", center_text("   This could lead to duplicate commits if you proceed."));
-    print_separator();
-
-    print!("❓ Do you want to push existing commits first? (y/n): ");
-    io::stdout().flush().unwrap();
-    let mut response = String::new();
-    io::stdin().read_line(&mut response).unwrap();
-    let response = response.trim().to_lowercase();
-
-    if response == "y" || response == "yes" {
-        println!("{}", center_text("⬆️  Pushing existing commits..."));
-        
-        // Check for GitHub token first
-        if get_github_token().is_none() {
-            println!("{}", center_text("❌ Cannot push: No GitHub token found"));
-            println!("{}", center_text("   Please set up your GitHub token as explained above"));
-            return false;
-        }
-        
-        if !check_internet_connection() {
-            println!("{}", center_text("⚠️  No internet connection. Cannot push existing commits."));
-            println!("{}", center_text("    Please resolve this before making new commits."));
-            return false;
-        }
-
-        if !configure_auth_remote(repo_path) {
-            println!("{}", center_text("❌ Failed to configure remote with authentication"));
-            return false;
-        }
-        
-        if !run("git", &["-C", &repo_path.to_string_lossy(), "push"]) {
-            println!("{}", center_text("❌ Failed to push existing commits. Aborting."));
-            return false;
-        }
-        
-        println!("{}", center_text("✅ Existing commits pushed successfully!"));
-        print_separator();
-        true
-    } else {
-        println!("{}", center_text("⚠️  Proceeding with new commit despite pending pushes..."));
-        print_separator();
-        true
-    }
-}
-
-fn get_repo_name(path: &Path) -> String {
-    // Try to get repository name from remote URL first
-    let remote_url = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["config", "--get", "remote.origin.url"])
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|url| url.trim().to_string());
-
-    if let Some(url) = remote_url {
-        // Extract repo name from the URL
-        // Examples:
-        // https://github.com/user/repo.git -> repo
-        // https://github.com/user/repo -> repo
-        // git@github.com:user/repo.git -> repo
-        if let Some(name) = extract_repo_name_from_url(&url) {
-            return name;
         }
     }
 
-    // Fallback: use directory name when URL is unavailable or unparsable
-    path.file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-        .to_string_lossy()
-        .to_string()
-}
-
-fn extract_repo_name_from_url(url: &str) -> Option<String> {
-    // Remove trailing .git if present
-    let url = url.trim_end_matches(".git");
-    
-    // Buscar el último segmento después del último /
-    if let Some(last_slash) = url.rfind('/') {
-        let name = &url[last_slash + 1..];
-        if !name.is_empty() {
-            return Some(name.to_string());
+    fn run_command(&self, args: &[&str]) -> Result<()> {
+        // Verificar que el directorio raíz existe
+        if !self.root.exists() {
+            return Err(GitError::CommandFailed(format!(
+                "Repository root directory does not exist: {}",
+                self.root.display()
+            )));
         }
-    }
-    
-    None
-}
 
-fn git_repo_status(path: &Path) -> Option<(String, String)> {
-    let branch = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["symbolic-ref", "--short", "HEAD"])
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or("(no branch)".to_string());
+        // Verificar que es un directorio
+        if !self.root.is_dir() {
+            return Err(GitError::CommandFailed(format!(
+                "Repository root is not a directory: {}",
+                self.root.display()
+            )));
+        }
 
-    let dirty = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["status", "--porcelain"])
-        .output().ok()
-        .map(|o| !o.stdout.is_empty()).unwrap_or(false);
+        // Verificar permisos de lectura
+        if std::fs::metadata(&self.root)
+            .map_err(|e| GitError::CommandFailed(format!(
+                "Cannot access repository directory {}: {}",
+                self.root.display(), e
+            )))?
+            .permissions().readonly()
+        {
+            return Err(GitError::CommandFailed(format!(
+                "Insufficient permissions to read repository: {}",
+                self.root.display()
+            )));
+        }
 
-    let upstream = Command::new("git")
-        .arg("-C").arg(path)
-        .args(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok());
+        // Configure the command with piped I/O
+        let child = self.create_command(args)
+            .stdin(Stdio::null())  // No input from stdin
+            .stdout(Stdio::piped())  // Capture stdout
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| GitError::CommandFailed(format!(
+                "Failed to spawn git command: {}", e
+            )))?;
+            
+        // Wait for the command to complete and capture output
+        let output = child.wait_with_output()
+            .map_err(|e| GitError::CommandFailed(format!(
+                "Failed to wait for git command: {}", e
+            )))?;
 
-    let (ahead, behind) = if let Some(up) = upstream {
-        let branch = branch.trim();
-        let up = up.trim();
-        let count = Command::new("git")
-            .arg("-C").arg(path)
-            .args(&["rev-list", "--left-right", "--count", &format!("{}...{}", branch, up)])
-            .output().ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .unwrap_or("0 0".to_string());
-        let parts: Vec<&str> = count.trim().split_whitespace().collect();
-        if parts.len() == 2 {
-            (parts[1].to_string(), parts[0].to_string())
+        // Log stderr if there was an error or if there's any output
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !stderr.is_empty() {
+                eprintln!("git stderr: {}", stderr);
+            }
+        }
+
+        // Log stdout if there's any output (only for non-sensitive commands)
+        let sensitive_commands = ["push", "pull", "fetch", "remote"];
+        let is_sensitive = args.iter().any(|&arg| sensitive_commands.contains(&arg));
+        
+        if !output.stdout.is_empty() && !is_sensitive {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                println!("{}", stdout);
+            }
+        }
+
+        if output.status.success() {
+            Ok(())
         } else {
-            ("0".to_string(), "0".to_string())
-        }
-    } else {
-        ("0".to_string(), "0".to_string())
-    };
-
-    let mut status = String::new();
-    if dirty { status += "📝"; }
-    if ahead != "0" { status += "⬆️"; }
-    if behind != "0" { status += "⬇️"; }
-    if status.is_empty() { status = "✅".to_string(); }
-
-    Some((branch.trim().to_string(), status))
-}
-
-fn list_child_git_repos(base: &Path) -> bool {
-    let mut found = false;
-    if let Ok(entries) = fs::read_dir(base) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.join(".git").exists() {
-                found = true;
-                let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
-                if let Some((branch, status)) = git_repo_status(&path) {
-                    println!("{:<30} [{:>10}] {}", dir_name, branch, status);
-                }
-            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(GitError::CommandFailed(format!(
+                "git command failed with status {}: git {}\nError: {}",
+                output.status, args.join(" "), stderr.trim()
+            )))
         }
     }
-    found
+
+    fn create_command<'a, I, S>(&self, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&self.root);
+        
+        // Add each argument separately to prevent injection
+        for arg in args {
+            cmd.arg(arg);
+        }
+        
+        if let Some(token) = get_github_token() {
+            cmd.env("GITHUB_TOKEN", token);
+        }
+        
+        cmd
+    }
+
+    fn configure_auth_remote(&self) -> Result<()> {
+        let token = match get_github_token() {
+            Some(t) => {
+                println!("🔑 Found GitHub token");
+                t
+            }
+            None => {
+                println!("ℹ️  No GitHub token found");
+                println!("   Tried: {}", TOKEN_ENV_VARS.join(", "));
+                return Ok(());
+            }
+        };
+
+        let remote_url = Self::get_remote_url(&self.root)
+            .ok_or_else(|| GitError::CommandFailed("Failed to get remote URL".to_string()))?;
+
+        if remote_url.starts_with("https://") {
+            // Configurar el helper de credenciales para almacenar en memoria (cache)
+            self.run_command(&["config", "--local", "credential.helper", "cache"])?;
+            
+            // Configurar el tiempo de caché (por defecto 15 minutos)
+            self.run_command(&["config", "--local", "credential.helper", "cache --timeout=3600"])?;
+            
+            // Configurar la URL remota sin credenciales
+            self.run_command(&["remote", "set-url", "origin", &remote_url])?;
+            
+            // Configurar el helper de credenciales para almacenamiento temporal
+            self.run_command(&["config", "--local", "credential.helper", "store --file=.git/credentials"])?;
+            
+            // Guardar las credenciales temporalmente
+            let mut cmd = self.create_command(&["credential", "approve"]);
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|e| GitError::CommandFailed(format!("Failed to spawn git credential command: {}", e)))?;
+            
+            if let Some(stdin) = child.stdin.as_mut() {
+                writeln!(stdin, "url={}", remote_url)
+                    .map_err(|e| GitError::CommandFailed(format!("Failed to write to git credential stdin: {}", e)))?;
+                writeln!(stdin, "username={}", token)
+                    .map_err(|e| GitError::CommandFailed(format!("Failed to write to git credential stdin: {}", e)))?;
+                writeln!(stdin, "password=x-oauth-basic")
+                    .map_err(|e| GitError::CommandFailed(format!("Failed to write to git credential stdin: {}", e)))?;
+            }
+            
+            let status = child.wait()
+                .map_err(|e| GitError::CommandFailed(format!("Failed to wait for git credential command: {}", e)))?;
+            
+            if !status.success() {
+                return Err(GitError::CommandFailed("Failed to store credentials".to_string()));
+            }
+            
+            println!("✅ Configured secure credential helper");
+        } else if remote_url.starts_with("git@") {
+            println!("ℹ️  Using SSH authentication (no token needed)");
+        } else {
+            println!("ℹ️  Remote already configured or using non-HTTPS protocol");
+        }
+
+        Ok(())
+    }
 }
 
-fn print_grouped_status(repo_path: &Path, pathspec: &str) {
-    use std::collections::BTreeMap;
+impl fmt::Display for GitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GitError::NoChanges => write!(f, "No changes to commit"),
+            GitError::NoCommitMessage => write!(f, "No commit message provided"),
+            GitError::CommandFailed(msg) => write!(f, "Command failed: {}", msg),
+            GitError::NoToken => write!(f, "No GitHub token found"),
+            GitError::NoInternet => write!(f, "No internet connection"),
+            _ => write!(f, "An unknown error occurred"),
+        }
+    }
+}
 
-    let output = match Command::new("git")
-        .arg("-C").arg(repo_path)
-        .args(&["status", "--porcelain=v1", "--", pathspec])
-        .output() {
-            Ok(o) => o,
-            Err(_) => return,
-        };
+// ============================================================================
+// UI HELPERS
+// ============================================================================
+
+struct UI;
+
+impl UI {
+    fn center_text(text: &str) -> String {
+        let width = terminal::size()
+            .map(|(w, _)| w as usize)
+            .unwrap_or_else(|_| 80);
+        let padding = (width.saturating_sub(text.len())) / 2;
+        format!("{}{}", " ".repeat(padding), text)
+    }
+
+    fn print_separator() {
+        let width = terminal::size()
+            .map(|(w, _)| w as usize)
+            .unwrap_or_else(|_| 80);
+        println!("{}", "─".repeat(width));
+    }
+
+    fn prompt_yes_no(question: &str) -> bool {
+        print!("❓ {} (y/n): ", question);
+        if let Err(e) = io::stdout().flush() {
+            eprintln!("Error flushing stdout: {}", e);
+            return false;
+        }
+        
+        let mut response = String::new();
+        if let Err(e) = io::stdin().read_line(&mut response) {
+            eprintln!("Error reading input: {}", e);
+            return false;
+        }
+        
+        matches!(response.trim().to_lowercase().as_str(), "y" | "yes")
+    }
+
+    fn prompt_input(prompt: &str) -> String {
+        print!("✏️  {}: ", prompt);
+        if let Err(e) = io::stdout().flush() {
+            eprintln!("Error flushing stdout: {}", e);
+            return String::new();
+        }
+        
+        let mut input = String::new();
+        if let Err(e) = io::stdin().read_line(&mut input) {
+            eprintln!("Error reading input: {}", e);
+            return String::new();
+        }
+        
+        input.trim().to_string()
+    }
+}
+
+// ============================================================================
+// STATUS DISPLAY
+// ============================================================================
+
+fn print_grouped_status(repo: &GitRepo, pathspec: &str) {
+    let output = match repo.create_command(&["status", "--porcelain=v1", "--", pathspec]).output() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for line in stdout.lines() {
-        // Format examples:
-        //  M path/to/file
-        // MM path/to/file
-        // A  path
-        // ?? path
-        // R  old -> new (we will show the full line under the group of the new path)
         let trimmed = line.trim_start();
         if trimmed.is_empty() { continue; }
 
-        // Extract path after the two-status columns (first 2 chars plus a space)
-        // Porcelain v1 guarantees that path starts at index >=3; for safety, find first space
         let mut parts = trimmed.splitn(2, ' ');
-        let _status = parts.next().unwrap_or("");
-        let rest = parts.next().unwrap_or("").trim_start();
+        let _status = parts.next().unwrap_or_default();
+        let rest = parts.next().unwrap_or_default().trim_start();
 
-        // Handle rename syntax: "old -> new"
+        // Handle renames: "old -> new"
         let path_part = if let Some(arrow_idx) = rest.find(" -> ") {
             &rest[arrow_idx + 4..]
         } else {
             rest
         };
 
-        // Determine top-level folder key
-        let key = match path_part.find('/') {
-            Some(idx) => path_part[..idx].to_string(),
-            None => ".".to_string(),
-        };
+        let key = path_part
+            .find('/')
+            .map(|idx| path_part[..idx].to_string())
+            .unwrap_or_else(|| ".".to_string());
 
         groups.entry(key).or_default().push(trimmed.to_string());
     }
 
     if groups.is_empty() {
-        println!("{}", center_text("🟢 No changes in current subpath"));
+        println!("{}", UI::center_text("🟢 No changes in current subpath"));
         return;
     }
 
     for (group, items) in groups {
-        println!("{}", center_text(&format!("📁 {}", if group == "." { "(root)".to_string() } else { group })));
+        let display_name = if group == "." { "(root)" } else { &group };
+        println!("{}", UI::center_text(&format!("📁 {}", display_name)));
         for item in items {
             println!("{}", item);
         }
-        print_separator();
+        UI::print_separator();
     }
 }
 
-fn main() {
-    let current = env::current_dir().expect("❌ Could not get current directory");
-    // Check if GITHUB_TOKEN is configured, exit early if not
+fn list_child_git_repos(base: &Path) -> bool {
+    let mut found = false;
+    
+    if let Ok(entries) = fs::read_dir(base) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join(".git").exists() {
+                found = true;
+                if let Some(repo) = GitRepo::find_from_path(path.clone()) {
+                    let (ahead, behind) = repo.get_ahead_behind_count();
+                    let dirty = repo.has_changes(None);
+                    
+                    let mut status = String::new();
+                    if dirty { status.push_str("📝"); }
+                    if ahead > 0 { status.push_str("⬆️"); }
+                    if behind > 0 { status.push_str("⬇️"); }
+                    if status.is_empty() { status = "✅".to_string(); }
+                    
+                    let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
+                    println!("{:<30} [{:>10}] {}", dir_name, repo.get_branch(), status);
+                }
+            }
+        }
+    }
+    
+    found
+}
+
+// ============================================================================
+// WORKFLOW FUNCTIONS
+// ============================================================================
+
+fn compute_pathspec(repo_root: &Path, current: &Path) -> String {
+    current
+        .strip_prefix(repo_root)
+        .ok()
+        .and_then(|p| {
+            let s = p.to_string_lossy().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
+    UI::print_separator();
+    println!("{}", UI::center_text("📄 Changes to be staged:"));
+    print_grouped_status(repo, pathspec);
+
+    if !repo.has_changes(Some(pathspec)) {
+        println!("{}", UI::center_text("🟢 No changes to add in the current folder"));
+        return Err(GitError::NoChanges);
+    }
+
+    // Ask for confirmation before staging
+    println!("\n{}", UI::center_text("Press Enter to stage these changes, or Ctrl+C to cancel..."));
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        println!("\n{}", UI::center_text("❌ Operation cancelled"));
+        return Err(GitError::CommandFailed("User cancelled the operation".into()));
+    }
+
+    // Stage changes
+    // Usar -- para prevenir que pathspec sea interpretado como opción
+    println!("\n{}", UI::center_text("⏳ Staging changes..."));
+    repo.run_command(&["add", "--", pathspec])?;
+    println!("{}", UI::center_text("✅ Changes added"));
+
+    // Verify staged changes exist
+    let has_staged = Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .arg("diff")
+        .arg("--cached")
+        .arg("--quiet")
+        .arg("--")
+        .arg(pathspec)
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
+    if !has_staged {
+        println!("{}", UI::center_text("ℹ️  There's nothing to commit"));
+        println!("{}", UI::center_text("   All changes are already committed"));
+        return Err(GitError::NoChanges);
+    }
+
+    // Show staged changes
+    UI::print_separator();
+    println!("{}", UI::center_text("📝 Staged changes to be committed:"));
+    repo.run_command(&["diff", "--cached", "--stat"])?;
+    
+    // Ask for confirmation before committing
+    println!("\n{}", UI::center_text("Press Enter to commit these changes, or any other key to cancel"));
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() || 
+       !input.trim().is_empty() {
+        println!("\n{}", UI::center_text("❌ Commit cancelled"));
+        return Err(GitError::CommandFailed("User cancelled the commit".into()));
+    }
+
+    UI::print_separator();
+    let message = UI::prompt_input("Enter commit message (or leave empty to cancel)");
+
+    if message.trim().is_empty() {
+        println!("\n{}", UI::center_text("❌ Commit cancelled - no message provided"));
+        return Err(GitError::NoCommitMessage);
+    }
+
+    // Usar -- para prevenir que el mensaje sea interpretado como opción
+    repo.run_command(&["commit", "-m", &message, "--"])?;
+    UI::print_separator();
+    
+    Ok(())
+}
+
+fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
+    // Verificar conflictos de merge
+    let has_conflicts = Command::new("git")
+        .arg("-C").arg(&repo.root)
+        .args(&["diff", "--name-only", "--diff-filter=U"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .map_err(|e| GitError::CommandFailed(format!("Failed to check for merge conflicts: {}", e)))?;
+
+    if has_conflicts {
+        return Err(GitError::CommandFailed(
+            "Tienes conflictos sin resolver. Por favor, resuélvelos antes de continuar.".into()
+        ));
+    }
+
+    // Verificar si hay un merge en progreso
+    let merge_head_exists = repo.root.join(".git/MERGE_HEAD").exists();
+    if merge_head_exists {
+        return Err(GitError::CommandFailed(
+            "Hay un merge en progreso. Por favor, completa o aborta el merge antes de continuar.".into()
+        ));
+    }
+
+    // Verificar si hay stash pendiente
+    let has_stash = Command::new("git")
+        .arg("-C").arg(&repo.root)
+        .args(&["stash", "list"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .map_err(|e| GitError::CommandFailed(format!("Failed to check for stashed changes: {}", e)))?;
+
+    if has_stash {
+        println!("{}", UI::center_text("⚠️  Advertencia: Tienes cambios guardados en stash"));
+        if !UI::prompt_yes_no("¿Deseas continuar de todos modos?") {
+            return Err(GitError::CommandFailed("Operación cancelada por el usuario".into()));
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
+    // Primero verificar si hay conflictos o estados problemáticos
+    if let Err(e) = check_git_conflicts(repo) {
+        println!("\n{}", UI::center_text("❌ Error de verificación:"));
+        println!("{}\n", UI::center_text(&e.to_string()));
+        return Err(e);
+    }
+
+    let (ahead, _) = repo.get_ahead_behind_count();
+    
+    if ahead == 0 {
+        println!("{}", UI::center_text("✅ No hay commits pendientes de subir"));
+        UI::print_separator();
+        return Ok(());
+    }
+
+    println!("{}", UI::center_text("⚠️  ADVERTENCIA: Tienes commits que necesitan ser subidos"));
+    println!("{}", UI::center_text(&format!("   {} commits por delante del repositorio remoto", ahead)));
+    println!("{}", UI::center_text("   Esto podría causar conflictos o commits duplicados."));
+    UI::print_separator();
+
+    if !UI::prompt_yes_no("¿Quieres subir los commits existentes primero?") {
+        println!("{}", UI::center_text("⚠️  Continuando con el nuevo commit sin subir cambios..."));
+        UI::print_separator();
+        return Ok(());
+    }
+
+    println!("{}", UI::center_text("⬆️  Subiendo commits existentes..."));
+    
     if get_github_token().is_none() {
-        println!("{}", center_text("❌ No GitHub token found in the environment"));
-        println!("{}", center_text("   Please set it up before continuing:"));
-        println!("");
-        println!("   1. Create a Personal Access Token in GitHub with 'repo' scope");
-        println!("   2. Add it to your shell configuration (e.g., ~/.zshrc):");
-        println!("      export GITHUB_TOKEN=your_token_here");
-        println!("   3. Reload your shell: source ~/.zshrc");
-        println!("");
-        println!("   Alternatively, you can use SSH for authentication instead.");
+        println!("{}", UI::center_text("❌ No se puede subir: No se encontró el token de GitHub"));
+        println!("{}", UI::center_text("   Por favor configura tu token de GitHub"));
+        return Err(GitError::NoToken);
+    }
+    
+    if !check_internet_connection() {
+        println!("{}", UI::center_text("⚠️  No internet connection. Cannot push existing commits."));
+        println!("{}", UI::center_text("    Please resolve this before making new commits."));
+        return Err(GitError::NoInternet);
+    }
+
+    repo.configure_auth_remote()?;
+    // Asegurarse de que push no reciba parámetros no deseados
+    repo.run_command(&["push", "--"])?;
+    
+    println!("{}", UI::center_text("✅ Existing commits pushed successfully!"));
+    UI::print_separator();
+    
+    Ok(())
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn get_github_token() -> Option<String> {
+    TOKEN_ENV_VARS
+        .iter()
+        .find_map(|var| env::var(var).ok())
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn check_internet_connection() -> bool {
+    match "8.8.8.8:53".parse() {
+        Ok(addr) => {
+            match TcpStream::connect_timeout(&addr, INTERNET_CHECK_TIMEOUT) {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("Error checking internet connection: {}", e);
+                    false
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("Error parsing IP address: {}", e);
+            false
+        }
+    }
+}
+
+fn print_token_setup_instructions() {
+    println!("{}", UI::center_text("❌ No GitHub token found in the environment"));
+    println!("{}", UI::center_text("   Please set it up before continuing:"));
+    println!();
+    println!("   1. Create a Personal Access Token in GitHub with 'repo' scope");
+    println!("   2. Add it to your shell configuration (e.g., ~/.zshrc):");
+    println!("      export GITHUB_TOKEN=your_token_here");
+    println!("   3. Reload your shell: source ~/.zshrc");
+    println!();
+    println!("   Alternatively, you can use SSH for authentication instead.");
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+fn main() {
+    // Check token early
+    if get_github_token().is_none() {
+        print_token_setup_instructions();
         return;
     }
-    let git_root = find_git_root(current.clone());
 
-    let repo_path = match git_root {
-        Some(path) => path,
+    let current_dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("❌ Could not get current directory: {}", e);
+            return;
+        }
+    };
+
+    let repo = match GitRepo::find_from_current_dir() {
+        Some(r) => r,
         None => {
-            println!("{}", center_text("📦 Searching for Git repositories in subfolders..."));
-            print_separator();
-            if !list_child_git_repos(&current) {
+            println!("{}", UI::center_text("📦 Searching for Git repositories in subfolders..."));
+            UI::print_separator();
+            if !list_child_git_repos(&current_dir) {
                 eprintln!("❌ You are not inside a Git repository nor are there any Git repositories in child directories.");
             }
             return;
         }
     };
 
-    // --- Tu flujo original aquí ---
-    let repo_name = get_repo_name(&repo_path);
+    UI::print_separator();
+    println!("{}", UI::center_text(&format!("📁 Repository root: {}", repo.name)));
+    UI::print_separator();
 
-    print_separator();
-    println!("{}", center_text(&format!("📁 Repository root: {}", repo_name)));
-    print_separator();
-
-    // Show from where we're operating (before status) — only Subpath as requested
-    show_subpath_info(&repo_path, &current);
-    print_separator();
-
-    if !show_repo_status(&repo_path) {
-        return;
-    }
-    print_separator();
-
-    // Check if there are commits pending to push
-    println!("{}", center_text("🔍 Checking for pending pushes..."));
-    let pending_push = check_pending_push(&repo_path);
-    if pending_push {
-        if !handle_pending_pushes(&repo_path) { return; }
+    let pathspec = compute_pathspec(&repo.root, &current_dir);
+    let subpath_display = if pathspec == "." {
+        ". (repo root)".to_string()
     } else {
-        println!("{}", center_text("✅ No pending pushes detected"));
-        print_separator();
-    }
+        pathspec.clone()
+    };
+    println!("{}", UI::center_text(&format!("🧭 Subpath: {}", subpath_display)));
+    UI::print_separator();
 
-    if !run_git_pull(&repo_path) {
+    // Show status
+    println!("{}", UI::center_text("🔍 Repository status:"));
+    // Status es seguro ya que no usa entrada de usuario
+    if repo.run_command(&["status", "--", "-sb"]).is_err() {
         return;
     }
-    print_separator();
+    UI::print_separator();
 
-    println!("{}", center_text("📦 Checking local changes..."));
-    // Determine the pathspec for the current subdirectory relative to repo root
-    let pathspec = compute_pathspec(&repo_path, &current);
-
-    // (Current path and subpath already shown above)
-
-    // All changes in the repo (anywhere)
-    let all_changes_exist = Command::new("git")
-        .arg("-C").arg(&repo_path)
-        .args(&["status", "--porcelain=v1"])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-
-    // Changes limited to the current directory
-    let changes_in_current_exist = Command::new("git")
-        .arg("-C").arg(&repo_path)
-        .args(&["status", "--porcelain=v1", "--", &pathspec])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-
-    // If there are changes in the parent but none in the current folder, warn and exit
-    if all_changes_exist && !changes_in_current_exist {
-        println!("{}", center_text("ℹ️  No changes detected in the current folder"));
-        println!("{}", center_text("   However, there are pending changes elsewhere in the repository."));
-        println!("{}", center_text("   Tip: run this tool from the repo root or navigate to the folder with changes."));
+    // Check pending pushes
+    println!("{}", UI::center_text("🔍 Checking for pending pushes..."));
+    if handle_pending_pushes(&repo).is_err() {
         return;
     }
 
-    // Stage and commit only within current directory
-    if !stage_and_commit_current_pathspec(&repo_path, &pathspec) { return; }
+    // Pull
+    println!("{}", UI::center_text("⬇️  Pulling changes..."));
+    // Pull es seguro ya que no usa entrada de usuario directamente
+    if repo.run_command(&["pull", "--"]).is_err() {
+        return;
+    }
+    UI::print_separator();
 
-    println!("{}", center_text("⬆️  Pushing changes..."));
+    // Check for changes
+    println!("{}", UI::center_text("📦 Checking local changes..."));
+    
+    let all_changes = repo.has_changes(None);
+    let current_changes = repo.has_changes(Some(&pathspec));
+
+    if all_changes && !current_changes {
+        println!("{}", UI::center_text("ℹ️  No changes detected in the current folder"));
+        println!("{}", UI::center_text("   However, there are pending changes elsewhere in the repository."));
+        println!("{}", UI::center_text("   Tip: run this tool from the repo root or navigate to the folder with changes."));
+        return;
+    }
+
+    // Stage and commit
+    if stage_and_commit(&repo, &pathspec).is_err() {
+        return;
+    }
+
+    // Push
+    println!("{}", UI::center_text("⬆️  Pushing changes..."));
+    
     if !check_internet_connection() {
-        println!("{}", center_text(MSG_NO_INTERNET_PUSH));
-        println!("{}", center_text(MSG_RUN_PUSH_MANUALLY));
+        println!("{}", UI::center_text(MSG_NO_INTERNET_PUSH));
+        println!("{}", UI::center_text(MSG_RUN_PUSH_MANUALLY));
         return;
     }
-    if !configure_auth_remote(&repo_path) { return; }
-    run("git", &["-C", &repo_path.to_string_lossy(), "push"]);
-}
 
+    if repo.configure_auth_remote().is_err() {
+        return;
+    }
+
+    // Asegurarse de que push no reciba parámetros no deseados
+    let _ = repo.run_command(&["push", "--"]);
+}
