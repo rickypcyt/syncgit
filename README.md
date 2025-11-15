@@ -41,7 +41,7 @@ cargo install syncgit
 ### Build from source
 
 ```bash
-git clone https://github.com/yourusername/syncgit.git
+git clone https://github.com/rickypcyt/syncgit-rustcli.git
 cd syncgit
 cargo install --path .
 ```
