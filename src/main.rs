@@ -624,9 +624,9 @@ fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
 }
 
 fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
-    // Primero verificar si hay conflictos o estados problemáticos
+    // First check for any conflicts or problematic states
     if let Err(e) = check_git_conflicts(repo) {
-        println!("\n{}", UI::center_text("❌ Error de verificación:"));
+        println!("\n{}", UI::center_text("❌ Verification error:"));
         println!("{}\n", UI::center_text(&e.to_string()));
         return Err(e);
     }
@@ -634,18 +634,18 @@ fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
     let (ahead, _) = repo.get_ahead_behind_count();
     
     if ahead == 0 {
-        println!("{}", UI::center_text("✅ No hay commits pendientes de subir"));
+        println!("{}", UI::center_text("✅ No pending commits to push"));
         UI::print_separator();
         return Ok(());
     }
 
-    println!("{}", UI::center_text("⚠️  ADVERTENCIA: Tienes commits que necesitan ser subidos"));
-    println!("{}", UI::center_text(&format!("   {} commits por delante del repositorio remoto", ahead)));
-    println!("{}", UI::center_text("   Esto podría causar conflictos o commits duplicados."));
+    println!("{}", UI::center_text("⚠️  WARNING: You have commits that need to be pushed"));
+    println!("{}", UI::center_text(&format!("   {} commits ahead of remote repository", ahead)));
+    println!("{}", UI::center_text("   This could cause conflicts or duplicate commits."));
     UI::print_separator();
 
-    if !UI::prompt_yes_no("¿Quieres subir los commits existentes primero?") {
-        println!("{}", UI::center_text("⚠️  Continuando con el nuevo commit sin subir cambios..."));
+    if !UI::prompt_yes_no("Do you want to push the existing commits first?") {
+        println!("{}", UI::center_text("⚠️  Continuing with the new commit without pushing changes..."));
         UI::print_separator();
         return Ok(());
     }
@@ -745,35 +745,47 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
         );
         
         if check_internet_connection() {
-            println!("\n{}", UI::center_text("Press Enter to start syncing, or Ctrl+C to cancel"));
+            println!("\n{}", UI::center_text(&format!("You have {} commits to sync from remote", behind)));
+            println!("{}", UI::center_text("Press Enter to view and sync these changes, or Ctrl+C to cancel"));
+            
             if !UI::wait_for_enter() {
                 println!("\n{}", UI::center_text("❌ Sync cancelled"));
                 return Ok(());
             }
             
-            println!("\n{}", UI::center_text("Starting sync..."));
-            println!("\n{}", UI::center_text("1. Fetching latest changes..."));
-            if UI::wait_for_enter() {
-                // First fetch the latest changes
-                repo.run_command(&["fetch", "origin"])?;
-                
-                // Get current branch name
-                let branch = repo.get_branch();
-                
-                // Pull with rebase and autostash to handle local changes
-                repo.run_command(&["pull", "--rebase", "--autostash", "origin", &branch])?;
-                
-                // Push any local changes that were rebased on top
-                if ahead > 0 {
-                    println!("Pushing local changes after sync...");
-                    repo.run_command(&["push", "origin", &branch])?;
-                }
-                
-                println!("✅ Successfully synced with remote!");
+            // Show what will be synced
+            if let Ok(output) = repo.run_command(&["log", "--oneline", "--graph", "--decorate", "--all", "-n", "5", "--no-merges", "--"]) {
+                println!("\n{}", UI::center_text("Latest changes to sync:"));
+                println!("{:?}", output);
             }
-        } else {
-            println!("\n{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
+            
+            println!("\n{}", UI::center_text("Press Enter to confirm sync, or Ctrl+C to cancel"));
+            if !UI::wait_for_enter() {
+                println!("\n{}", UI::center_text("❌ Sync cancelled"));
+                return Ok(());
+            }
+            
+            println!("\n{}", UI::center_text("🔄 Syncing changes..."));
+            
+            // First fetch the latest changes
+            repo.run_command(&["fetch", "origin"])?;
+            
+            // Get current branch name
+            let branch = repo.get_branch();
+            
+            // Pull with rebase and autostash to handle local changes
+            repo.run_command(&["pull", "--rebase", "--autostash", "origin", &branch])?;
+            
+            // Push any local changes that were rebased on top
+            if ahead > 0 {
+                println!("Pushing local changes after sync...");
+                repo.run_command(&["push", "origin", &branch])?;
+            }
+            
+            println!("✅ Successfully synced with remote!");
         }
+    } else {
+        println!("\n{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
     }
     
     if ahead == 0 && behind == 0 {
