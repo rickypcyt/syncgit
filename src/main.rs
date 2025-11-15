@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::net::TcpStream;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use std::fs;
 
 use crossterm::terminal;
 
@@ -19,10 +20,35 @@ const TOKEN_ENV_VARS: &[&str] = &["GITHUB_TOKEN", "GH_TOKEN", "GIT_TOKEN"];
 const INTERNET_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ============================================================================
+// GITHUB AUTH FUNCTIONS
+// ============================================================================
+
+fn get_github_token() -> Option<String> {
+    // Check environment variables for token
+    for var in TOKEN_ENV_VARS {
+        if let Ok(token) = std::env::var(var) {
+            if !token.trim().is_empty() {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn check_internet_connection() -> bool {
+    // Try to connect to a reliable server (Google's DNS)
+    TcpStream::connect_timeout(
+        &"8.8.8.8:53".parse().unwrap(),
+        INTERNET_CHECK_TIMEOUT
+    ).is_ok()
+}
+
+// ============================================================================
 // ERROR HANDLING
 // ============================================================================
 
 use std::fmt;
+use std::error::Error;
 
 #[derive(Debug)]
 enum GitError {
@@ -35,7 +61,9 @@ enum GitError {
     Other(String),
 }
 
-type Result<T> = std::result::Result<T, GitError>;
+impl Error for GitError {}
+
+type Result<T = ()> = std::result::Result<T, GitError>;
 
 // ============================================================================
 // GIT OPERATIONS
@@ -95,6 +123,10 @@ impl GitRepo {
             }
         }
         output
+    }
+
+    fn has_remote(&self) -> bool {
+        Self::get_remote_url(&self.root).is_some()
     }
 
     fn parse_repo_name_from_url(url: &str) -> Option<String> {
@@ -400,7 +432,7 @@ impl fmt::Display for GitError {
             GitError::CommandFailed(msg) => write!(f, "Command failed: {}", msg),
             GitError::NoToken => write!(f, "No GitHub token found"),
             GitError::NoInternet => write!(f, "No internet connection"),
-            _ => write!(f, "An unknown error occurred"),
+            GitError::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -699,34 +731,300 @@ fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
 }
 
 // ============================================================================
-// UTILITY FUNCTIONS
+// REPOSITORY INITIALIZATION
 // ============================================================================
 
-fn get_github_token() -> Option<String> {
-    TOKEN_ENV_VARS
-        .iter()
-        .find_map(|var| env::var(var).ok())
-        .filter(|token| !token.trim().is_empty())
+fn initialize_git_repo(path: &Path) -> Result<GitRepo> {
+    // Initialize git repository with 'main' as default branch
+    let output = Command::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .current_dir(path)
+        .output()
+        .map_err(|e| GitError::Other(format!("Failed to run git init: {}", e)))?;
+
+    if !output.status.success() {
+        return Err(GitError::Other("Failed to initialize Git repository".to_string()));
+    }
+
+    // Create initial commit
+    let repo = GitRepo {
+        root: path.to_path_buf(),
+        name: path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("new-repo"))
+            .to_string_lossy()
+            .to_string(),
+    };
+    
+    // Ensure we're on main branch (in case git init created master)
+    // Note: With git init -b main, the branch should already be main,
+    // but we check and rename if it's master (for older git versions)
+    if let Ok(current_branch) = repo.run_command_with_output(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        let branch_name = current_branch.trim();
+        if branch_name == "master" {
+            // Rename master to main only if it exists
+            repo.run_command(&["branch", "-m", "master", "main"])
+                .map_err(|e| GitError::Other(format!("Failed to rename branch to main: {}", e)))?;
+        }
+    }
+    // If we can't determine the branch, that's okay - git init -b main should have created main
+
+    // Create .gitignore if it doesn't exist
+    let gitignore_path = path.join(".gitignore");
+    if !gitignore_path.exists() {
+        let default_gitignore = "# Default .gitignore for new repositories\n\
+# OS generated files\n.DS_Store\n.DS_Store?\n._*\n.Spotlight-V100\n.Trashes\nehthumbs.db\nThumbs.db\n\n# Build artifacts\ntarget/\n**/*.rs.bk\nCargo.lock\n\n# Editor directories and files\n.idea\n.vscode\n*.swp\n*.swo\n*~";
+        
+        fs::write(&gitignore_path, default_gitignore)
+            .map_err(|e| GitError::Other(format!("Failed to create .gitignore: {}", e)))?;
+    }
+    
+    // Add all files and create initial commit
+    repo.run_command(&["add", "--all"])?;
+    
+    // Check if there are any changes to commit
+    if repo.has_changes(None) {
+        repo.run_command(&["commit", "-m", "Initial commit"])?;
+        println!("\n✅ Created initial commit");
+    } else {
+        println!("\nℹ️  No files to commit in the initial repository");
+    }
+
+    Ok(repo)
 }
 
-fn check_internet_connection() -> bool {
-    match "8.8.8.8:53".parse() {
-        Ok(addr) => {
-            match TcpStream::connect_timeout(&addr, INTERNET_CHECK_TIMEOUT) {
-                Ok(_) => true,
-                Err(e) => {
-                    eprintln!("Error checking internet connection: {}", e);
-                    false
+fn create_github_repo(repo: &GitRepo) -> Result<()> {
+    if !check_internet_connection() {
+        return Err(GitError::NoInternet);
+    }
+
+    let token = get_github_token().ok_or(GitError::NoToken)?;
+    let default_repo_name = repo.root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("new-repo")
+        .to_string();
+    
+    // Ask for repository name with default
+    let repo_name = loop {
+        let input_name = UI::prompt_input(&format!("Enter GitHub repository name [{}]: ", default_repo_name));
+        let repo_name = if input_name.trim().is_empty() {
+            default_repo_name.clone()
+        } else {
+            input_name.trim().to_string()
+        };
+        
+        // Validate repository name (GitHub requirements: alphanumeric, -, _, and . only)
+        if repo_name.is_empty() {
+            println!("{}", UI::center_text("❌ Repository name cannot be empty. Please try again."));
+            continue;
+        }
+        if !repo_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            println!("{}", UI::center_text("❌ Repository name can only contain alphanumeric characters, hyphens, underscores, and dots. Please try again."));
+            continue;
+        }
+        break repo_name;
+    };
+
+    // Ask for description
+    let description = UI::prompt_input("Enter repository description (optional): ");
+    
+    // Ask if should be private
+    let is_private = UI::prompt_yes_no("Should this repository be private?");
+    
+    println!("\n{}", UI::center_text("🔄 Creating GitHub repository..."));
+    
+    // Create repository using GitHub API
+    let client = reqwest::blocking::Client::new();
+    let mut request_body = serde_json::json!({
+        "name": repo_name,
+        "private": is_private,
+    });
+    
+    if !description.trim().is_empty() {
+        request_body["description"] = serde_json::Value::String(description.trim().to_string());
+    }
+    
+    let response = client
+        .post("https://api.github.com/user/repos")
+        .header("User-Agent", "syncgit")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github.v3+json")
+        .json(&request_body)
+        .send()
+        .map_err(|e| GitError::Other(format!("Failed to send request to GitHub API: {}", e)))?;
+    
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_msg = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        
+        // Check if repository already exists (422 status with "already exists" message)
+        if status == 422 && error_msg.contains("already exists") {
+            println!("\n{}", UI::center_text(&format!("⚠️  Repository '{}' already exists on GitHub", repo_name)));
+            if UI::prompt_yes_no("Do you want to use the existing repository and push to it?") {
+                // Get GitHub username from API
+                let username = client
+                    .get("https://api.github.com/user")
+                    .header("User-Agent", "syncgit")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Accept", "application/vnd.github.v3+json")
+                    .send()
+                    .and_then(|r| r.json::<serde_json::Value>())
+                    .ok()
+                    .and_then(|json| json["login"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                
+                // Get the existing repository URL
+                let existing_repo_url = format!("https://github.com/{}/{}", username, repo_name);
+                
+                // Add remote origin if it doesn't exist
+                if !repo.has_remote() {
+                    repo.run_command(&["remote", "add", "origin", &format!("{}.git", existing_repo_url)])?;
+                } else {
+                    // Update existing remote
+                    repo.run_command(&["remote", "set-url", "origin", &format!("{}.git", existing_repo_url)])?;
                 }
+                
+                // Get current branch and push
+                let branch = repo.run_command_with_output(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .map(|b| b.trim().to_string())
+                    .unwrap_or_else(|_| "main".to_string());
+                
+                println!("\n{}", UI::center_text("🚀 Pushing to existing GitHub repository..."));
+                repo.configure_auth_remote()?;
+                repo.run_command(&["push", "-u", "origin", &branch])?;
+                println!("\n{}", UI::center_text(&format!("✅ Successfully pushed to GitHub repository: {}", existing_repo_url)));
+                return Ok(());
+            } else {
+                return Err(GitError::Other("Repository creation cancelled by user".to_string()));
             }
+        }
+        
+        // Provide helpful error messages for common issues
+        let detailed_error = if status == 401 {
+            format!("Authentication failed. Please check your GitHub token. Error: {}", error_msg)
+        } else if status == 422 {
+            format!("Invalid repository name or repository already exists. Error: {}", error_msg)
+        } else if status == 403 {
+            format!("Permission denied. Your token may not have 'repo' scope. Error: {}", error_msg)
+        } else {
+            format!("GitHub API error (status {}): {}", status, error_msg)
+        };
+        
+        return Err(GitError::Other(detailed_error));
+    }
+    
+    let response_json: serde_json::Value = response.json()
+        .map_err(|e| GitError::Other(format!("Failed to parse GitHub response: {}", e)))?;
+    
+    let repo_url = response_json["html_url"]
+        .as_str()
+        .ok_or_else(|| GitError::Other("Failed to get repository URL from GitHub response".to_string()))?;
+    
+    // Get current branch name (defaults to main)
+    let branch = repo.run_command_with_output(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|b| b.trim().to_string())
+        .unwrap_or_else(|_| "main".to_string());
+    
+    // Get the clone URL (SSH or HTTPS) from the response
+    let clone_url = response_json["clone_url"]
+        .as_str()
+        .ok_or_else(|| GitError::Other("Failed to get clone URL from GitHub response".to_string()))?;
+    
+    // Add remote origin
+    if let Err(e) = repo.run_command(&["remote", "add", "origin", clone_url]) {
+        if let Ok(output) = repo.run_command_with_output(&["remote", "get-url", "origin"]) {
+            println!("ℹ️  Remote 'origin' already exists: {}", output.trim());
+            if !UI::prompt_yes_no("Do you want to update the existing remote URL?") {
+                println!("\n⚠️  Using existing remote. You may need to manually set up tracking.");
+                return Ok(());
+            }
+            repo.run_command(&["remote", "set-url", "origin", clone_url])?;
+        } else {
+            return Err(e);
+        }
+    }
+    
+    // Ask for initial commit message if there are no commits yet
+    let has_commits = repo.run_command_with_output(&["rev-list", "--count", "--all"])
+        .map(|output| output.trim() != "0")  // If output is not "0", then there are commits
+        .unwrap_or(false);
+        
+    if !has_commits {
+        let commit_message = UI::prompt_input("Enter initial commit message (or press Enter for 'Initial commit'): ");
+        let commit_message = if commit_message.trim().is_empty() {
+            "Initial commit"
+        } else {
+            commit_message.trim()
+        };
+        
+        // Stage all files
+        repo.run_command(&["add", "."])?;
+        
+        // Create initial commit
+        repo.run_command(&["commit", "-m", commit_message])?;
+        println!("\n✅ Created initial commit with message: {}", commit_message);
+    }
+    
+    println!("\n🚀 Pushing to GitHub repository...");
+    
+    // First, try to push with -u (which sets upstream)
+    match repo.run_command(&["push", "-u", "origin", &branch]) {
+        Ok(_) => {
+            println!("\n✅ Successfully pushed to GitHub repository: {}", repo_url);
+            Ok(())
         },
         Err(e) => {
-            eprintln!("Error parsing IP address: {}", e);
-            false
+            println!("\n⚠️  Failed to push to remote repository: {}", e);
+            
+            // Try to fetch first in case the remote has changes
+            println!("\n🔄 Fetching from remote...");
+            if let Err(e) = repo.run_command(&["fetch"]) {
+                println!("⚠️  Failed to fetch from remote: {}", e);
+            }
+            
+            // Try to set up tracking with a more robust approach
+            println!("\n🔗 Setting up tracking...");
+            
+            // Create commands with proper references to branch
+            let branch_ref = branch.as_str();
+            let setup_commands = [
+                ("branch", vec!["--set-upstream-to".to_string(), format!("origin/{}", branch_ref), branch_ref.to_string()]),
+                ("push", vec!["-u".to_string(), "origin".to_string(), branch_ref.to_string()]),
+            ];
+            
+            for (cmd, args) in setup_commands.iter() {
+                let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                if let Err(e) = repo.run_command(&args_refs) {
+                    println!("⚠️  Command failed: git {} {}", cmd, args.join(" "));
+                    println!("   Error: {}", e);
+                }
+            }
+            
+            // Final attempt to push
+            if UI::prompt_yes_no("Would you like to try pushing again?") {
+                if let Err(e) = repo.run_command(&["push"]) {
+                    println!("\n❌ Final push attempt failed: {}", e);
+                    println!("\nYou may need to manually set up tracking with these commands:");
+                    println!("  git branch --set-upstream-to=origin/{} {}", branch, branch);
+                    println!("  git push -u origin {}", branch);
+                    return Err(GitError::Other("Failed to push to remote repository".to_string()));
+                } else {
+                    println!("\n✅ Successfully pushed to GitHub repository!");
+                    return Ok(());
+                }
+            }
+            
+            Err(GitError::Other("Push to remote repository was not completed".to_string()))
         }
     }
 }
 
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+#[allow(dead_code)]
 fn print_token_setup_instructions() {
     println!("{}", UI::center_text("❌ No GitHub token found in the environment"));
     println!("{}", UI::center_text("   Please set it up before continuing:"));
@@ -812,9 +1110,9 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
             }
             
             println!("✅ Successfully synced with remote!");
+        } else {
+            println!("\n{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
         }
-    } else {
-        println!("\n{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
     }
     
     if ahead == 0 && behind == 0 {
@@ -824,27 +1122,44 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
     Ok(())
 }
 
-fn main() {
-    // Check token early
-    if get_github_token().is_none() {
-        print_token_setup_instructions();
-        return;
-    }
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Get current directory
+    let current_dir = env::current_dir()
+        .map_err(|e| GitError::Other(format!("Failed to get current directory: {}", e)))?;
 
-    // Get current directory and find git repo
-    let current_dir = match env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("❌ Could not get current directory: {}", e);
-            return;
-        }
-    };
-
+    // Try to find existing git repo or initialize a new one
     let repo = match GitRepo::find_from_path(&current_dir) {
         Some(repo) => repo,
         None => {
-            println!("{}", UI::center_text("❌ No Git repository found"));
-            return;
+            println!("No Git repository found in current directory or its parents.");
+            println!("Do you want to initialize a new Git repository here? (y/n)");
+            
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)
+                .map_err(|e| GitError::Other(format!("Failed to read input: {}", e)))?;
+            
+            if input.trim().to_lowercase() == "y" {
+                let new_repo = initialize_git_repo(&current_dir)?;
+                
+                // Ask if user wants to create GitHub repository
+                UI::print_separator();
+                if UI::prompt_yes_no("Do you want to create a GitHub repository and push to it?") {
+                    if let Err(e) = create_github_repo(&new_repo) {
+                        println!("\n{}: {}", UI::center_text("⚠️  Warning"), e);
+                        println!("{}", UI::center_text("You can create the repository manually later."));
+                        UI::print_separator();
+                    } else {
+                        println!("\n{}", UI::center_text("✅ Repository created and pushed to GitHub!"));
+                        UI::print_separator();
+                        return Ok(());
+                    }
+                }
+                
+                new_repo
+            } else {
+                println!("Exiting...");
+                return Ok(());
+            }
         }
     };
 
@@ -869,25 +1184,31 @@ fn main() {
 
     // Show status
     println!("{}", UI::center_text("🔍 Repository status:"));
-    // Status es seguro ya que no usa entrada de usuario
-    if repo.run_command(&["status", "--", "-sb"]).is_err() {
-        return;
-    }
+    // Status is safe as it doesn't use user input
+    repo.run_command(&["status", "--", "-sb"])?;
     UI::print_separator();
 
     // Check pending pushes
     println!("{}", UI::center_text("🔍 Checking for pending pushes..."));
-    if handle_pending_pushes(&repo).is_err() {
-        return;
-    }
+    handle_pending_pushes(&repo)?;
 
-    // Pull
-    println!("{}", UI::center_text("⬇️  Pulling changes..."));
-    // Pull es seguro ya que no usa entrada de usuario directamente
-    if repo.run_command(&["pull", "--"]).is_err() {
-        return;
+    // Pull only if remote exists
+    if repo.has_remote() {
+        println!("{}", UI::center_text("⬇️  Pulling changes..."));
+        // Pull is safe as it doesn't directly use user input
+        if let Err(e) = repo.run_command(&["pull", "--"]) {
+            // If pull fails due to no upstream, that's okay for new repos
+            let error_msg = e.to_string();
+            if !error_msg.contains("no upstream configured") && !error_msg.contains("no tracking information") {
+                return Err(Box::new(e) as Box<dyn std::error::Error>);
+            }
+            // Otherwise, just continue
+        }
+        UI::print_separator();
+    } else {
+        println!("{}", UI::center_text("ℹ️  No remote configured. Skipping pull."));
+        UI::print_separator();
     }
-    UI::print_separator();
 
     // Check for changes
     println!("{}", UI::center_text("📦 Checking local changes..."));
@@ -899,38 +1220,42 @@ fn main() {
         println!("{}", UI::center_text("ℹ️  No changes detected in the current folder"));
         println!("{}", UI::center_text("   However, there are pending changes elsewhere in the repository."));
         println!("{}", UI::center_text("   Tip: run this tool from the repo root or navigate to the folder with changes."));
-        return;
+        return Ok(());
     }
 
     // Stage and commit
-    if stage_and_commit(&repo, &pathspec).is_err() {
-        return;
-    }
+    stage_and_commit(&repo, &pathspec)?;
 
-    // Ask for confirmation before pushing
-    println!("\n{}", UI::center_text("⚠️  You're about to push your changes to the remote repository."));
-    println!("{}", UI::center_text("   Press Enter to confirm push, or Ctrl+C to cancel"));
-    
-    if !UI::wait_for_enter() {
-        println!("\n{}", UI::center_text("❌ Push cancelled"));
-        return;
-    }
-    
-    println!("\n{}", UI::center_text("⬆️  Pushing changes..."));
-    
-    if !check_internet_connection() {
-        println!("{}", UI::center_text(MSG_NO_INTERNET_PUSH));
-        println!("{}", UI::center_text(MSG_RUN_PUSH_MANUALLY));
-        return;
-    }
+    // Only push if remote exists
+    if repo.has_remote() {
+        // Ask for confirmation before pushing
+        println!("\n{}", UI::center_text("⚠️  You're about to push your changes to the remote repository."));
+        println!("{}", UI::center_text("   Press Enter to confirm push, or Ctrl+C to cancel"));
+        
+        if !UI::wait_for_enter() {
+            println!("\n{}", UI::center_text("❌ Push cancelled"));
+            return Ok(());
+        }
+        
+        println!("\n{}", UI::center_text("⬆️  Pushing changes..."));
+        
+        if !check_internet_connection() {
+            println!("{}", UI::center_text(MSG_NO_INTERNET_PUSH));
+            println!("{}", UI::center_text(MSG_RUN_PUSH_MANUALLY));
+            return Ok(());
+        }
 
-    if repo.configure_auth_remote().is_err() {
-        return;
-    }
+        repo.configure_auth_remote()?;
 
-    // Ensure push doesn't receive any unwanted parameters
-    match repo.run_command(&["push", "--"]) {
-        Ok(_) => println!("\n{}", UI::center_text("✅ Changes pushed successfully!")),
-        Err(e) => println!("\n{}: {}", UI::center_text("❌ Error pushing changes"), e),
+        // Ensure push doesn't receive any unwanted parameters
+        repo.run_command(&["push", "--"])?;
+        println!("\n{}", UI::center_text("✅ Changes pushed successfully!"));
+    } else {
+        println!("\n{}", UI::center_text("ℹ️  No remote configured. Changes committed locally."));
+        if UI::prompt_yes_no("Do you want to create a GitHub repository and push to it?") {
+            create_github_repo(&repo)?;
+        }
     }
+    
+    Ok(())
 }

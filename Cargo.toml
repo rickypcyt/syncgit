@@ -11,6 +11,10 @@ exclude = ["target/*"]
 [dependencies]
 # TUI deps for responsive UI
 crossterm = "0.27"
+# HTTP client for GitHub API
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+# JSON serialization/deserialization
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3
