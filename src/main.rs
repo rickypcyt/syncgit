@@ -434,6 +434,14 @@ impl UI {
         
         input.trim().to_string()
     }
+
+    fn wait_for_enter() -> bool {
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => true,
+            Err(_) => false
+        }
+    }
 }
 
 // ============================================================================
@@ -737,7 +745,14 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
         );
         
         if check_internet_connection() {
-            println!("\n{}", UI::center_text("Press Enter to pull and sync changes, or Ctrl+C to cancel"));
+            println!("\n{}", UI::center_text("Press Enter to start syncing, or Ctrl+C to cancel"));
+            if !UI::wait_for_enter() {
+                println!("\n{}", UI::center_text("❌ Sync cancelled"));
+                return Ok(());
+            }
+            
+            println!("\n{}", UI::center_text("Starting sync..."));
+            println!("\n{}", UI::center_text("1. Fetching latest changes..."));
             if UI::wait_for_enter() {
                 // First fetch the latest changes
                 repo.run_command(&["fetch", "origin"])?;
