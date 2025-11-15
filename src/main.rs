@@ -719,7 +719,8 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
         println!("{} commits ahead of remote", ahead);
         
         if check_internet_connection() {
-            if UI::prompt_yes_no("Do you want to push these changes now?") {
+            println!("\n{}", UI::center_text("Press Enter to push changes, or Ctrl+C to cancel"));
+            if UI::wait_for_enter() {
                 repo.configure_auth_remote()?;
                 repo.run_command(&["push", "--"])?;
                 println!("{}", UI::center_text("✅ Changes pushed successfully!"));
@@ -736,12 +737,13 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
         );
         
         if check_internet_connection() {
-            if UI::prompt_yes_no("Do you want to pull and sync changes now?") {
+            println!("\n{}", UI::center_text("Press Enter to pull and sync changes, or Ctrl+C to cancel"));
+            if UI::wait_for_enter() {
                 // First fetch the latest changes
                 repo.run_command(&["fetch", "origin"])?;
                 
                 // Get current branch name
-                let branch = repo.get_branch()?;
+                let branch = repo.get_branch();
                 
                 // Pull with rebase and autostash to handle local changes
                 repo.run_command(&["pull", "--rebase", "--autostash", "origin", &branch])?;
