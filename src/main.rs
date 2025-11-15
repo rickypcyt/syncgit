@@ -730,16 +730,32 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
     }
     
     if behind > 0 {
-        println!("\n{}", UI::center_text("⚠️  Your local branch is behind remote:"));
-        println!("{} commits behind remote", behind);
+        println!("\n{}: {} commits behind remote", 
+            UI::center_text("⚠️  Your local branch is behind"), 
+            behind
+        );
         
         if check_internet_connection() {
-            if UI::prompt_yes_no("Do you want to pull the latest changes?") {
-                repo.run_command(&["pull", "--rebase", "--"])?;
-                println!("{}", UI::center_text("✅ Changes pulled successfully!"));
+            if UI::prompt_yes_no("Do you want to pull and sync changes now?") {
+                // First fetch the latest changes
+                repo.run_command(&["fetch", "origin"])?;
+                
+                // Get current branch name
+                let branch = repo.get_branch()?;
+                
+                // Pull with rebase and autostash to handle local changes
+                repo.run_command(&["pull", "--rebase", "--autostash", "origin", &branch])?;
+                
+                // Push any local changes that were rebased on top
+                if ahead > 0 {
+                    println!("Pushing local changes after sync...");
+                    repo.run_command(&["push", "origin", &branch])?;
+                }
+                
+                println!("✅ Successfully synced with remote!");
             }
         } else {
-            println!("{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
+            println!("\n{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
         }
     }
     
