@@ -3,7 +3,6 @@ use std::process::{Command, Stdio};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::net::TcpStream;
-use std::fs;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -48,18 +47,15 @@ struct GitRepo {
 }
 
 impl GitRepo {
-    fn find_from_current_dir() -> Option<Self> {
-        let current = env::current_dir().ok()?;
-        Self::find_from_path(current)
-    }
-
-    fn find_from_path(mut path: PathBuf) -> Option<Self> {
+    fn find_from_path(path: &Path) -> Option<Self> {
+        let mut current = path.to_path_buf();
         loop {
-            if path.join(".git").is_dir() {
-                let name = Self::extract_repo_name(&path);
-                return Some(GitRepo { root: path, name });
+            if current.join(".git").exists() {
+                let name = Self::extract_repo_name(&current);
+                return Some(GitRepo { root: current, name });
             }
-            if !path.pop() {
+
+            if !current.pop() {
                 return None;
             }
         }
@@ -491,34 +487,6 @@ fn print_grouped_status(repo: &GitRepo, pathspec: &str) {
     }
 }
 
-fn list_child_git_repos(base: &Path) -> bool {
-    let mut found = false;
-    
-    if let Ok(entries) = fs::read_dir(base) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.join(".git").exists() {
-                found = true;
-                if let Some(repo) = GitRepo::find_from_path(path.clone()) {
-                    let (ahead, behind) = repo.get_ahead_behind_count();
-                    let dirty = repo.has_changes(None);
-                    
-                    let mut status = String::new();
-                    if dirty { status.push_str("📝"); }
-                    if ahead > 0 { status.push_str("⬆️"); }
-                    if behind > 0 { status.push_str("⬇️"); }
-                    if status.is_empty() { status = "✅".to_string(); }
-                    
-                    let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
-                    println!("{:<30} [{:>10}] {}", dir_name, repo.get_branch(), status);
-                }
-            }
-        }
-    }
-    
-    found
-}
-
 // ============================================================================
 // WORKFLOW FUNCTIONS
 // ============================================================================
@@ -743,6 +711,45 @@ fn print_token_setup_instructions() {
 // MAIN
 // ============================================================================
 
+fn check_sync_status(repo: &GitRepo) -> Result<()> {
+    let (ahead, behind) = repo.get_ahead_behind_count();
+    
+    if ahead > 0 {
+        println!("\n{}", UI::center_text("⚠️  You have unpushed changes:"));
+        println!("{} commits ahead of remote", ahead);
+        
+        if check_internet_connection() {
+            if UI::prompt_yes_no("Do you want to push these changes now?") {
+                repo.configure_auth_remote()?;
+                repo.run_command(&["push", "--"])?;
+                println!("{}", UI::center_text("✅ Changes pushed successfully!"));
+            }
+        } else {
+            println!("{}", UI::center_text("ℹ️  No internet connection. Changes will remain local for now."));
+        }
+    }
+    
+    if behind > 0 {
+        println!("\n{}", UI::center_text("⚠️  Your local branch is behind remote:"));
+        println!("{} commits behind remote", behind);
+        
+        if check_internet_connection() {
+            if UI::prompt_yes_no("Do you want to pull the latest changes?") {
+                repo.run_command(&["pull", "--rebase", "--"])?;
+                println!("{}", UI::center_text("✅ Changes pulled successfully!"));
+            }
+        } else {
+            println!("{}", UI::center_text("ℹ️  No internet connection. Working with local version for now."));
+        }
+    }
+    
+    if ahead == 0 && behind == 0 {
+        println!("\n{}", UI::center_text("✅ Your repository is in sync with remote"));
+    }
+    
+    Ok(())
+}
+
 fn main() {
     // Check token early
     if get_github_token().is_none() {
@@ -750,6 +757,7 @@ fn main() {
         return;
     }
 
+    // Get current directory and find git repo
     let current_dir = match env::current_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -758,17 +766,19 @@ fn main() {
         }
     };
 
-    let repo = match GitRepo::find_from_current_dir() {
-        Some(r) => r,
+    let repo = match GitRepo::find_from_path(&current_dir) {
+        Some(repo) => repo,
         None => {
-            println!("{}", UI::center_text("📦 Searching for Git repositories in subfolders..."));
-            UI::print_separator();
-            if !list_child_git_repos(&current_dir) {
-                eprintln!("❌ You are not inside a Git repository nor are there any Git repositories in child directories.");
-            }
+            println!("{}", UI::center_text("❌ No Git repository found"));
             return;
         }
     };
+
+    // Check sync status at startup
+    if let Err(e) = check_sync_status(&repo) {
+        println!("\n{}: {}", UI::center_text("⚠️  Warning"), e);
+        // Continue execution even if sync check fails
+    }
 
     UI::print_separator();
     println!("{}", UI::center_text(&format!("📁 Repository root: {}", repo.name)));
