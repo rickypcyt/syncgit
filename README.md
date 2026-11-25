@@ -84,7 +84,7 @@ When you’re in a parent folder with multiple projects, the subpath status is g
 
 ## ⚡ Watch mode (default)
 
-Running `syncgit` opens a live, VS Code–style source control view. It shows "Waiting for changes..." and lists modified, new and deleted files as soon as they change. Type a commit message and press:
+Running `syncgit` opens a live, VS Code–style source control view. It shows "All set, nothing to commit" and lists modified, new and deleted files as soon as they change. Type a commit message and press:
 
 The screen is split into boxes flush to the left: a **Changes / Files** list on the left and a **code viewer** on the right. The viewer shows the whole file with additions in green and removals in red (new files are all green; unchanged files in the Files explorer show plain code). Everything works with the keyboard or the mouse (click files and tabs, scroll with the wheel).
 

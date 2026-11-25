@@ -68,6 +68,41 @@ enum Level {
 enum Mode {
     Changes,
     Files,
+    Log,
+    Branches,
+}
+
+const TABS: [Mode; 4] = [Mode::Changes, Mode::Files, Mode::Log, Mode::Branches];
+
+#[derive(Debug, PartialEq)]
+struct Commit {
+    hash: String,
+    short: String,
+    author: String,
+    date: String,
+    subject: String,
+}
+
+#[derive(Debug, PartialEq)]
+struct Branch {
+    name: String,
+    key: String,
+    current: bool,
+    remote: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewKind {
+    File,
+    Commit,
+    Branch,
+}
+
+/// What the viewer should show. `key` identifies the selection in the UI.
+struct ViewReq {
+    key: String,
+    target: String,
+    kind: ViewKind,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -107,10 +142,11 @@ struct TreeRow {
 
 /// UI -> worker.
 enum Cmd {
-    /// Which file the viewer should show (None = nothing / a folder).
-    View(Option<String>),
-    /// Whether the Files explorer is visible (the file list is only loaded then).
-    WantFiles(bool),
+    /// What the viewer should show (None = nothing / a folder).
+    View(Option<ViewReq>),
+    /// Which tab is visible (its list is only loaded then).
+    Want(Mode),
+    Checkout { name: String, remote: bool },
     Commit { message: String, push: bool },
     Push,
     Pull,
@@ -126,8 +162,10 @@ enum Update {
         has_remote: bool,
     },
     Files(Vec<String>),
+    Log(Vec<Commit>),
+    Branches(Vec<Branch>),
     View {
-        path: String,
+        key: String,
         lines: Vec<ViewLine>,
     },
     Done {
@@ -145,24 +183,50 @@ struct Layout {
     left_w: usize,
     right_w: usize,
     box_h: usize,
-    tab_changes: (usize, usize),
-    tab_files: (usize, usize),
+    tabs: [(Mode, usize, usize); 4],
 }
 
-fn compute_layout(width: usize, height: usize, n_changes: usize) -> Option<Layout> {
-    if width < 60 || height < 12 {
+/// Tab labels: the active tab is spelled out, the others are abbreviated.
+fn tab_specs(active: Mode, n_changes: usize) -> Vec<(Mode, String)> {
+    let count = if n_changes > 99 {
+        "99+".to_string()
+    } else {
+        n_changes.to_string()
+    };
+    TABS.iter()
+        .map(|&mode| {
+            let label = match (mode, mode == active) {
+                (Mode::Changes, true) => format!("Changes ({})", count),
+                (Mode::Changes, false) => "Chg".to_string(),
+                (Mode::Files, _) => "Files".to_string(),
+                (Mode::Log, _) => "Log".to_string(),
+                (Mode::Branches, true) => "Branches".to_string(),
+                (Mode::Branches, false) => "Br".to_string(),
+            };
+            (mode, label)
+        })
+        .collect()
+}
+
+fn compute_layout(width: usize, height: usize, mode: Mode, n_changes: usize) -> Option<Layout> {
+    if width < 70 || height < 12 {
         return None;
     }
-    let left_w = (width * 32 / 100).clamp(30, 52);
-    let label = format!("Changes ({})", n_changes).chars().count();
+    let left_w = (width * 32 / 100).clamp(38, 56);
+    let mut tabs = [(Mode::Changes, 0usize, 0usize); 4];
+    let mut cursor = 3;
+    for (i, (m, label)) in tab_specs(mode, n_changes).iter().enumerate() {
+        let len = label.chars().count();
+        tabs[i] = (*m, cursor, cursor + len);
+        cursor += len + 3;
+    }
     Some(Layout {
         width,
         height,
         left_w,
         right_w: width - left_w,
         box_h: height - 5,
-        tab_changes: (3, 3 + label),
-        tab_files: (3 + label + 3, 3 + label + 3 + 5),
+        tabs,
     })
 }
 
@@ -177,13 +241,20 @@ struct App {
     files: Vec<String>,
     collapsed: HashSet<String>,
     rows: Vec<TreeRow>,
+    commits: Vec<Commit>,
+    branches: Vec<Branch>,
     sel_change: Option<String>,
     sel_file: Option<String>,
+    sel_log: Option<String>,
+    sel_branch: Option<String>,
     scroll_changes: usize,
     scroll_files: usize,
+    scroll_log: usize,
+    scroll_branches: usize,
     follow: bool,
     view: Vec<ViewLine>,
     view_path: Option<String>,
+    view_title: String,
     requested_view: Option<String>,
     view_scroll: usize,
     layout: Option<Layout>,
@@ -292,6 +363,133 @@ fn load_files(repo: &GitRepo) -> Option<Vec<String>> {
     Some(files)
 }
 
+fn parse_commit(line: &str) -> Option<Commit> {
+    let mut parts = line.splitn(5, '\u{1f}');
+    let hash = parts.next()?;
+    let short = parts.next()?;
+    let author = parts.next()?;
+    let date = parts.next()?;
+    let subject = parts.next()?;
+    if hash.is_empty() {
+        return None;
+    }
+    Some(Commit {
+        hash: hash.to_string(),
+        short: short.to_string(),
+        author: author.to_string(),
+        date: date.to_string(),
+        subject: subject.to_string(),
+    })
+}
+
+fn load_log(repo: &GitRepo) -> Option<Vec<Commit>> {
+    let out = git(
+        repo,
+        &[
+            "log",
+            "-n",
+            "300",
+            "--date=short",
+            "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s",
+        ],
+    )
+    .ok()?;
+    Some(out.lines().filter_map(parse_commit).collect())
+}
+
+fn load_branches(repo: &GitRepo) -> Option<Vec<Branch>> {
+    let out = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(HEAD)%x1f%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .ok()?;
+    let mut branches: Vec<Branch> = Vec::new();
+    for line in out.lines() {
+        let Some((head, refname)) = line.split_once('\u{1f}') else {
+            continue;
+        };
+        let (name, remote) = if let Some(n) = refname.strip_prefix("refs/heads/") {
+            (n, false)
+        } else if let Some(n) = refname.strip_prefix("refs/remotes/") {
+            (n, true)
+        } else {
+            continue;
+        };
+        if remote && name.ends_with("/HEAD") {
+            continue;
+        }
+        branches.push(Branch {
+            name: name.to_string(),
+            key: format!("{}{}", if remote { "r:" } else { "l:" }, name),
+            current: head.trim() == "*",
+            remote,
+        });
+    }
+    branches.sort_by_key(|b| (b.remote, !b.current));
+    Some(branches)
+}
+
+fn build_commit_view(repo: &GitRepo, hash: &str) -> Vec<ViewLine> {
+    let out = match git(
+        repo,
+        &[
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "-U5",
+            "--date=format:%Y-%m-%d %H:%M",
+            "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
+            hash,
+        ],
+    ) {
+        Ok(o) => o,
+        Err(e) => return vec![ViewLine::note(&first_line(&e))],
+    };
+    let split = out.find("diff --git ").unwrap_or(out.len());
+    let (head, body) = out.split_at(split);
+    let mut lines: Vec<ViewLine> = head
+        .lines()
+        .map(|l| ViewLine::note(&clean_text(l)))
+        .collect();
+    lines.extend(parse_diff(body, true));
+    lines
+}
+
+fn build_branch_view(repo: &GitRepo, name: &str) -> Vec<ViewLine> {
+    match git(
+        repo,
+        &[
+            "log",
+            "-n",
+            "80",
+            "--date=short",
+            "--pretty=format:%h  %ad  %an  %s",
+            name,
+            "--",
+        ],
+    ) {
+        Ok(out) => {
+            let mut lines = vec![
+                ViewLine::note(&format!("Latest commits on {}", name)),
+                ViewLine::note(""),
+            ];
+            lines.extend(out.lines().map(|l| ViewLine {
+                kind: LineKind::Ctx,
+                old_no: None,
+                new_no: None,
+                text: clean_text(l),
+            }));
+            lines
+        }
+        Err(e) => vec![ViewLine::note(&first_line(&e))],
+    }
+}
+
 fn parse_counts(text: &str) -> Option<(usize, usize)> {
     let mut parts = text.split_whitespace();
     let ahead = parts.next()?.parse().ok()?;
@@ -333,12 +531,20 @@ fn parse_hunk_start(token: &str) -> usize {
 }
 
 /// Turns a unified diff (with huge context) into annotated lines.
-fn parse_diff(diff: &str) -> Vec<ViewLine> {
+fn parse_diff(diff: &str, headers: bool) -> Vec<ViewLine> {
     let mut out: Vec<ViewLine> = Vec::new();
     let (mut old_no, mut new_no) = (1usize, 1usize);
     let mut in_hunk = false;
 
     for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_hunk = false;
+            if headers {
+                let name = line.rsplit(" b/").next().unwrap_or(line);
+                out.push(ViewLine::note(&format!("── {} ──", name)));
+            }
+            continue;
+        }
         if line.starts_with("@@") {
             let mut parts = line.split_whitespace();
             parts.next();
@@ -419,7 +625,7 @@ fn build_view(repo: &GitRepo, path: &str, code: Option<&str>) -> Vec<ViewLine> {
                 &["diff", "HEAD", "-U99999", "--no-color", "--no-ext-diff", "--", path],
             ) {
                 Ok(diff) => {
-                    let lines = parse_diff(&diff);
+                    let lines = parse_diff(&diff, false);
                     if lines.is_empty() {
                         read_file_lines(repo, path, LineKind::Ctx)
                     } else {
@@ -494,6 +700,18 @@ fn do_push(repo: &GitRepo) -> (Level, String) {
     }
 }
 
+fn do_checkout(repo: &GitRepo, name: &str, remote: bool) -> (Level, String) {
+    let args: Vec<&str> = if remote {
+        vec!["switch", "--track", name]
+    } else {
+        vec!["switch", name]
+    };
+    match git(repo, &args) {
+        Ok(_) => (Level::Ok, format!("Switched to {}", name)),
+        Err(e) => (Level::Err, format!("Checkout failed: {}", first_line(&e))),
+    }
+}
+
 fn do_pull(repo: &GitRepo) -> (Level, String) {
     match git(repo, &["pull", "--rebase", "--autostash"]) {
         Ok(_) => (Level::Ok, "Up to date with remote".to_string()),
@@ -527,8 +745,8 @@ fn do_commit(repo: &GitRepo, message: &str, push: bool) -> (Level, String, bool)
 fn worker(repo: GitRepo, commands: Receiver<Cmd>, updates: Sender<Update>) {
     let mut entries: Vec<Entry> = Vec::new();
     let mut have_entries = false;
-    let mut want_files = false;
-    let mut view_path: Option<String> = None;
+    let mut tab = Mode::Changes;
+    let mut view_req: Option<ViewReq> = None;
     let mut view_stamp: Option<SystemTime> = None;
     let mut next_status = Instant::now();
     let mut next_sync = Instant::now();
@@ -542,15 +760,24 @@ fn worker(repo: GitRepo, commands: Receiver<Cmd>, updates: Sender<Update>) {
             .saturating_duration_since(Instant::now());
 
         match commands.recv_timeout(wait) {
-            Ok(Cmd::View(path)) => {
-                view_path = path;
+            Ok(Cmd::View(req)) => {
+                view_req = req;
                 force_view = true;
             }
-            Ok(Cmd::WantFiles(wanted)) => {
-                want_files = wanted;
-                if wanted {
-                    force_sync = true;
-                }
+            Ok(Cmd::Want(mode)) => {
+                tab = mode;
+                force_sync = true;
+            }
+            Ok(Cmd::Checkout { name, remote }) => {
+                let (level, text) = do_checkout(&repo, &name, remote);
+                let _ = updates.send(Update::Done {
+                    level,
+                    text,
+                    clear_message: false,
+                });
+                force_status = true;
+                force_sync = true;
+                force_view = true;
             }
             Ok(Cmd::Commit { message, push }) => {
                 let (level, text, clear_message) = do_commit(&repo, &message, push);
@@ -607,12 +834,21 @@ fn worker(repo: GitRepo, commands: Receiver<Cmd>, updates: Sender<Update>) {
             if updates.send(read_sync(&repo)).is_err() {
                 return;
             }
-            if want_files {
-                if let Some(files) = load_files(&repo) {
-                    if updates.send(Update::Files(files)).is_err() {
-                        return;
-                    }
-                }
+            let sent = match tab {
+                Mode::Files => match load_files(&repo) {
+                    Some(files) => updates.send(Update::Files(files)).is_ok(),
+                    None => true,
+                },
+                Mode::Log => updates
+                    .send(Update::Log(load_log(&repo).unwrap_or_default()))
+                    .is_ok(),
+                Mode::Branches => updates
+                    .send(Update::Branches(load_branches(&repo).unwrap_or_default()))
+                    .is_ok(),
+                Mode::Changes => true,
+            };
+            if !sent {
+                return;
             }
             next_sync = Instant::now() + SYNC_REFRESH;
             force_sync = false;
@@ -620,22 +856,32 @@ fn worker(repo: GitRepo, commands: Receiver<Cmd>, updates: Sender<Update>) {
 
         // Only rebuild the viewer when the selection, the git status or the
         // file itself changed (modification time) since the last time.
-        match &view_path {
-            Some(path) => {
-                let stamp = fs::metadata(repo.root.join(path))
-                    .and_then(|m| m.modified())
-                    .ok();
+        match &view_req {
+            Some(req) => {
+                let stamp = if req.kind == ViewKind::File {
+                    fs::metadata(repo.root.join(&req.target))
+                        .and_then(|m| m.modified())
+                        .ok()
+                } else {
+                    None
+                };
                 if force_view || stamp != view_stamp {
-                    let code = entries
-                        .iter()
-                        .find(|e| &e.path == path)
-                        .map(|e| e.code.clone());
-                    let lines = build_view(&repo, path, code.as_deref());
+                    let lines = match req.kind {
+                        ViewKind::File => {
+                            let code = entries
+                                .iter()
+                                .find(|e| e.path == req.target)
+                                .map(|e| e.code.clone());
+                            build_view(&repo, &req.target, code.as_deref())
+                        }
+                        ViewKind::Commit => build_commit_view(&repo, &req.target),
+                        ViewKind::Branch => build_branch_view(&repo, &req.target),
+                    };
                     view_stamp = stamp;
                     force_view = false;
                     if updates
                         .send(Update::View {
-                            path: path.clone(),
+                            key: req.key.clone(),
                             lines,
                         })
                         .is_err()
@@ -677,13 +923,20 @@ impl App {
             files: Vec::new(),
             collapsed: HashSet::new(),
             rows: Vec::new(),
+            commits: Vec::new(),
+            branches: Vec::new(),
             sel_change: None,
             sel_file: None,
+            sel_log: None,
+            sel_branch: None,
             scroll_changes: 0,
             scroll_files: 0,
+            scroll_log: 0,
+            scroll_branches: 0,
             follow: true,
             view: Vec::new(),
             view_path: None,
+            view_title: String::new(),
             requested_view: None,
             view_scroll: 0,
             layout: None,
@@ -705,7 +958,7 @@ impl App {
 
     /// True while something on screen moves by itself (spinners).
     fn animating(&self) -> bool {
-        self.busy.is_some() || !self.loaded || (self.mode == Mode::Changes && self.entries.is_empty())
+        self.busy.is_some() || !self.loaded
     }
 
     /// Applies everything the worker has produced. Returns true if the screen changed.
@@ -737,8 +990,18 @@ impl App {
                     self.normalize_selection();
                     self.sync_view_request();
                 }
-                Update::View { path, lines } => {
-                    if self.view_path.as_deref() == Some(path.as_str()) {
+                Update::Log(commits) => {
+                    self.commits = commits;
+                    self.normalize_selection();
+                    self.sync_view_request();
+                }
+                Update::Branches(branches) => {
+                    self.branches = branches;
+                    self.normalize_selection();
+                    self.sync_view_request();
+                }
+                Update::View { key, lines } => {
+                    if self.view_path.as_deref() == Some(key.as_str()) {
                         self.view = lines;
                     }
                 }
@@ -764,13 +1027,26 @@ impl App {
         match self.mode {
             Mode::Changes => self.entries.len(),
             Mode::Files => self.rows.len(),
+            Mode::Log => self.commits.len(),
+            Mode::Branches => self.branches.len(),
         }
     }
 
-    fn selected_path(&self) -> Option<String> {
+    fn scroll_value(&self) -> usize {
+        match self.mode {
+            Mode::Changes => self.scroll_changes,
+            Mode::Files => self.scroll_files,
+            Mode::Log => self.scroll_log,
+            Mode::Branches => self.scroll_branches,
+        }
+    }
+
+    fn selected_key(&self) -> Option<String> {
         match self.mode {
             Mode::Changes => self.sel_change.clone(),
             Mode::Files => self.sel_file.clone(),
+            Mode::Log => self.sel_log.clone(),
+            Mode::Branches => self.sel_branch.clone(),
         }
     }
 
@@ -784,6 +1060,14 @@ impl App {
                 .sel_file
                 .as_ref()
                 .and_then(|p| self.rows.iter().position(|r| &r.path == p)),
+            Mode::Log => self
+                .sel_log
+                .as_ref()
+                .and_then(|h| self.commits.iter().position(|c| &c.hash == h)),
+            Mode::Branches => self
+                .sel_branch
+                .as_ref()
+                .and_then(|k| self.branches.iter().position(|b| &b.key == k)),
         };
         found.unwrap_or(0)
     }
@@ -803,36 +1087,94 @@ impl App {
         if !file_ok {
             self.sel_file = self.rows.first().map(|r| r.path.clone());
         }
+        let log_ok = self
+            .sel_log
+            .as_ref()
+            .map_or(false, |h| self.commits.iter().any(|c| &c.hash == h));
+        if !log_ok {
+            self.sel_log = self.commits.first().map(|c| c.hash.clone());
+        }
+        let branch_ok = self
+            .sel_branch
+            .as_ref()
+            .map_or(false, |k| self.branches.iter().any(|b| &b.key == k));
+        if !branch_ok {
+            self.sel_branch = self
+                .branches
+                .iter()
+                .find(|b| b.current)
+                .or_else(|| self.branches.first())
+                .map(|b| b.key.clone());
+        }
     }
 
-    /// Tells the worker which file to show whenever the selection changed.
+    /// Tells the worker what to show whenever the selection changed.
     fn sync_view_request(&mut self) {
-        let path = self.selected_path();
-        if path == self.requested_view {
+        let key = self.selected_key();
+        if key == self.requested_view {
             return;
         }
-        self.requested_view = path.clone();
-        self.view_path = path.clone();
+        self.requested_view = key.clone();
+        self.view_path = key.clone();
         self.view_scroll = 0;
 
-        match path {
+        let key = match key {
+            Some(k) => k,
             None => {
                 self.view.clear();
+                self.view_title.clear();
                 let _ = self.tx.send(Cmd::View(None));
+                return;
             }
-            Some(p) => {
+        };
+
+        let request = match self.mode {
+            Mode::Changes | Mode::Files => {
+                self.view_title = key.clone();
                 let is_dir = self.mode == Mode::Files
-                    && self.rows.iter().any(|r| r.path == p && r.is_dir);
+                    && self.rows.iter().any(|r| r.path == key && r.is_dir);
                 if is_dir {
                     self.view = vec![ViewLine::note(
                         "Folder: use Right / Left (or click) to expand or collapse",
                     )];
-                    let _ = self.tx.send(Cmd::View(None));
+                    None
                 } else {
-                    let _ = self.tx.send(Cmd::View(Some(p)));
+                    Some(ViewReq {
+                        key: key.clone(),
+                        target: key,
+                        kind: ViewKind::File,
+                    })
                 }
             }
-        }
+            Mode::Log => {
+                self.view_title = self
+                    .commits
+                    .iter()
+                    .find(|c| c.hash == key)
+                    .map(|c| format!("{} · {} · {}", c.short, c.author, c.date))
+                    .unwrap_or_else(|| key.clone());
+                Some(ViewReq {
+                    key: key.clone(),
+                    target: key,
+                    kind: ViewKind::Commit,
+                })
+            }
+            Mode::Branches => {
+                let name = self
+                    .branches
+                    .iter()
+                    .find(|b| b.key == key)
+                    .map(|b| b.name.clone())
+                    .unwrap_or_else(|| key.clone());
+                self.view_title = name.clone();
+                Some(ViewReq {
+                    key,
+                    target: name,
+                    kind: ViewKind::Branch,
+                })
+            }
+        };
+        let _ = self.tx.send(Cmd::View(request));
     }
 
     fn select_index(&mut self, index: usize) {
@@ -845,6 +1187,16 @@ impl App {
             Mode::Files => {
                 if let Some(r) = self.rows.get(index) {
                     self.sel_file = Some(r.path.clone());
+                }
+            }
+            Mode::Log => {
+                if let Some(c) = self.commits.get(index) {
+                    self.sel_log = Some(c.hash.clone());
+                }
+            }
+            Mode::Branches => {
+                if let Some(b) = self.branches.get(index) {
+                    self.sel_branch = Some(b.key.clone());
                 }
             }
         }
@@ -866,13 +1218,13 @@ impl App {
             return;
         }
         self.mode = mode;
-        let _ = self.tx.send(Cmd::WantFiles(mode == Mode::Files));
+        let _ = self.tx.send(Cmd::Want(mode));
         if mode == Mode::Files {
             self.rebuild_rows();
         }
         self.normalize_selection();
         self.follow = true;
-        // The same path may be selected in both modes; force a fresh request.
+        // The same key may be selected in several modes; force a fresh request.
         self.requested_view = None;
         self.sync_view_request();
     }
@@ -938,6 +1290,8 @@ impl App {
         match self.mode {
             Mode::Changes => &mut self.scroll_changes,
             Mode::Files => &mut self.scroll_files,
+            Mode::Log => &mut self.scroll_log,
+            Mode::Branches => &mut self.scroll_branches,
         }
     }
 
@@ -985,6 +1339,26 @@ impl App {
             "Committing...".to_string()
         });
         let _ = self.tx.send(Cmd::Commit { message, push });
+    }
+
+    fn checkout_selected(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let (name, remote, current) = match self
+            .sel_branch
+            .as_ref()
+            .and_then(|k| self.branches.iter().find(|b| &b.key == k))
+        {
+            Some(b) => (b.name.clone(), b.remote, b.current),
+            None => return,
+        };
+        if current {
+            self.set(Level::Info, format!("Already on {}", name));
+            return;
+        }
+        self.busy = Some(format!("Switching to {}...", name));
+        let _ = self.tx.send(Cmd::Checkout { name, remote });
     }
 
     fn push(&mut self) {
@@ -1043,12 +1417,8 @@ impl App {
             KeyCode::Home => self.view_scroll = 0,
             KeyCode::End => self.view_scroll = usize::MAX / 2,
             KeyCode::Tab => {
-                let next = if self.mode == Mode::Changes {
-                    Mode::Files
-                } else {
-                    Mode::Changes
-                };
-                self.switch_mode(next);
+                let index = TABS.iter().position(|m| *m == self.mode).unwrap_or(0);
+                self.switch_mode(TABS[(index + 1) % TABS.len()]);
             }
             KeyCode::Right => {
                 if let Some((path, true)) = self.selected_is_dir() {
@@ -1062,7 +1432,9 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.message.trim().is_empty() {
-                    if let Some((path, collapsed)) = self.selected_is_dir() {
+                    if self.mode == Mode::Branches {
+                        self.checkout_selected();
+                    } else if let Some((path, collapsed)) = self.selected_is_dir() {
                         self.set_collapsed(&path, !collapsed);
                     } else {
                         self.set(Level::Info, "Type a commit message, then press Enter");
@@ -1106,17 +1478,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if in_left => {
                 if row == 1 {
-                    if col >= layout.tab_changes.0 && col < layout.tab_changes.1 {
-                        self.switch_mode(Mode::Changes);
-                    } else if col >= layout.tab_files.0 && col < layout.tab_files.1 {
-                        self.switch_mode(Mode::Files);
+                    for (mode, start, end) in layout.tabs.iter().copied() {
+                        if col >= start && col < end {
+                            self.switch_mode(mode);
+                            break;
+                        }
                     }
                 } else if row >= 2 && row < layout.box_h {
-                    let scroll = match self.mode {
-                        Mode::Changes => self.scroll_changes,
-                        Mode::Files => self.scroll_files,
-                    };
-                    let index = scroll + row - 2;
+                    let index = self.scroll_value() + row - 2;
                     if index < self.list_len() {
                         self.select_index(index);
                         if let Some((path, collapsed)) = self.selected_is_dir() {
@@ -1195,6 +1564,20 @@ fn pad(text: &str, width: usize) -> String {
     format!("{}{}", cut, " ".repeat(width.saturating_sub(used)))
 }
 
+fn hints_for(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Branches => {
+            "↑↓ select · Enter switch to branch (empty message) · Tab next tab · ^P push · ^L pull · Esc quit"
+        }
+        Mode::Log => {
+            "↑↓ select commit · PgUp/PgDn scroll diff · Tab next tab · Enter commit+push · ^P push · ^L pull · Esc quit"
+        }
+        _ => {
+            "↑↓ select · Tab next tab · ←→ fold · PgUp/PgDn scroll · Enter commit+push · ^S commit · ^P push · ^L pull · Esc quit"
+        }
+    }
+}
+
 fn spinner_frame(app: &App) -> &'static str {
     SPINNER[(app.started.elapsed().as_millis() / 100) as usize % SPINNER.len()]
 }
@@ -1228,24 +1611,20 @@ fn left_cells(app: &App, l: &Layout) -> Vec<String> {
     let inner_h = l.box_h - 2;
     let mut out: Vec<String> = Vec::with_capacity(l.box_h);
 
-    let changes_label = format!("Changes ({})", app.entries.len());
-    let (s1, s2) = match app.mode {
-        Mode::Changes => (
-            paint(&changes_label, C_ACCENT, None, true),
-            paint("Files", C_DIM, None, false),
-        ),
-        Mode::Files => (
-            paint(&changes_label, C_DIM, None, false),
-            paint("Files", C_ACCENT, None, true),
-        ),
-    };
-    let title = format!("{}{}{}", s1, paint(" │ ", C_BORDER, None, false), s2);
-    out.push(top_border(
-        l.left_w,
-        &title,
-        changes_label.chars().count() + 3 + 5,
-        C_BORDER,
-    ));
+    let specs = tab_specs(app.mode, app.entries.len());
+    let mut parts: Vec<String> = Vec::new();
+    let mut visible = 0usize;
+    for (mode, label) in &specs {
+        visible += label.chars().count();
+        parts.push(if *mode == app.mode {
+            paint(label, C_ACCENT, None, true)
+        } else {
+            paint(label, C_DIM, None, false)
+        });
+    }
+    visible += 3 * specs.len().saturating_sub(1);
+    let title = parts.join(&paint(" │ ", C_BORDER, None, false));
+    out.push(top_border(l.left_w, &title, visible, C_BORDER));
 
     let codes: HashMap<&str, &str> = app
         .entries
@@ -1253,10 +1632,7 @@ fn left_cells(app: &App, l: &Layout) -> Vec<String> {
         .map(|e| (e.path.as_str(), e.code.as_str()))
         .collect();
     let current = app.current_index();
-    let scroll = match app.mode {
-        Mode::Changes => app.scroll_changes,
-        Mode::Files => app.scroll_files,
-    };
+    let scroll = app.scroll_value();
 
     for i in 0..inner_h {
         let index = scroll + i;
@@ -1267,14 +1643,18 @@ fn left_cells(app: &App, l: &Layout) -> Vec<String> {
             Mode::Changes => {
                 if app.entries.is_empty() {
                     let label = if app.loaded {
-                        "Waiting for changes..."
+                        "All set, nothing to commit"
                     } else {
                         "Loading..."
                     };
                     match i {
                         0 => format!(
                             " {} {}",
-                            paint(spinner_frame(app), C_ACCENT, None, false),
+                            if app.loaded {
+                                paint("✔", C_ADD_FG, None, true)
+                            } else {
+                                paint(spinner_frame(app), C_ACCENT, None, false)
+                            },
                             paint(&pad(label, inner_w.saturating_sub(3)), Color::Reset, None, true)
                         ),
                         1 if app.loaded => paint(
@@ -1317,6 +1697,44 @@ fn left_cells(app: &App, l: &Layout) -> Vec<String> {
                         let text = format!(" {}  {}", indent, r.name);
                         paint(&pad(&text, inner_w), color, bg, false)
                     }
+                } else {
+                    " ".repeat(inner_w)
+                }
+            }
+            Mode::Log => {
+                if let Some(c) = app.commits.get(index) {
+                    let text_w = inner_w.saturating_sub(9);
+                    format!(
+                        "{}{}{}",
+                        paint(" ", Color::Reset, bg, false),
+                        paint(&pad(&c.short, 7), C_MOD, bg, false),
+                        paint(
+                            &format!(" {}", pad(&c.subject, text_w)),
+                            Color::Reset,
+                            bg,
+                            false
+                        )
+                    )
+                } else if app.commits.is_empty() && i == 0 {
+                    paint(&pad("  No commits yet", inner_w), C_DIM, None, false)
+                } else {
+                    " ".repeat(inner_w)
+                }
+            }
+            Mode::Branches => {
+                if let Some(b) = app.branches.get(index) {
+                    let marker = if b.current { "●" } else { " " };
+                    let color = if b.current {
+                        C_ADD_FG
+                    } else if b.remote {
+                        C_DIM
+                    } else {
+                        Color::Reset
+                    };
+                    let text = format!(" {} {}", marker, b.name);
+                    paint(&pad(&text, inner_w), color, bg, b.current)
+                } else if app.branches.is_empty() && i == 0 {
+                    paint(&pad("  No branches yet", inner_w), C_DIM, None, false)
                 } else {
                     " ".repeat(inner_w)
                 }
@@ -1369,7 +1787,7 @@ fn right_cells(app: &App, l: &Layout) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(l.box_h);
 
     let title_text = match &app.view_path {
-        Some(p) => tail(p, inner_w.saturating_sub(8)),
+        Some(_) => tail(&app.view_title, inner_w.saturating_sub(8)),
         None => "Viewer".to_string(),
     };
     let visible = title_text.chars().count();
@@ -1456,7 +1874,7 @@ fn build_frame(app: &App, l: &Layout) -> (Vec<String>, u16, u16) {
     lines[l.height - 2] = bottom_border(l.width, C_ACCENT);
 
     // Hints / status / busy
-    let hints = "↑↓ select · Tab Changes/Files · ←→ fold · PgUp/PgDn scroll · Enter commit+push · ^S commit · ^P push · ^L pull · Esc quit";
+    let hints = hints_for(app.mode);
     lines[l.height - 1] = if let Some(label) = &app.busy {
         format!(
             " {} {}",
@@ -1496,7 +1914,7 @@ fn render(app: &mut App, prev: &mut Vec<String>) -> io::Result<()> {
     let (w, h) = terminal::size()?;
     let (width, height) = (w as usize, h as usize);
 
-    app.layout = compute_layout(width, height, app.entries.len());
+    app.layout = compute_layout(width, height, app.mode, app.entries.len());
     app.fix_scroll();
 
     let mut buf: Vec<u8> = Vec::new();
@@ -1506,7 +1924,7 @@ fn render(app: &mut App, prev: &mut Vec<String>) -> io::Result<()> {
         None => {
             prev.clear();
             queue!(buf, Clear(ClearType::All), MoveTo(0, 0))?;
-            write!(buf, "Terminal too small (need at least 60x12)")?;
+            write!(buf, "Terminal too small (need at least 70x12)")?;
         }
         Some(layout) => {
             let (lines, cursor_col, cursor_row) = build_frame(app, &layout);
@@ -1625,7 +2043,7 @@ mod tests {
     #[test]
     fn parses_diff_with_line_numbers() {
         let diff = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
-        let lines = parse_diff(diff);
+        let lines = parse_diff(diff, false);
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].kind, LineKind::Ctx);
         assert_eq!((lines[0].old_no, lines[0].new_no), (Some(1), Some(1)));
@@ -1634,6 +2052,37 @@ mod tests {
         assert_eq!(lines[2].kind, LineKind::Add);
         assert_eq!((lines[2].old_no, lines[2].new_no), (None, Some(2)));
         assert_eq!((lines[3].old_no, lines[3].new_no), (Some(3), Some(3)));
+    }
+
+    #[test]
+    fn parses_commit_lines() {
+        let c = parse_commit("abc123\u{1f}abc\u{1f}Ana\u{1f}2025-11-15\u{1f}Fix: thing").unwrap();
+        assert_eq!(c.short, "abc");
+        assert_eq!(c.author, "Ana");
+        assert_eq!(c.subject, "Fix: thing");
+        assert!(parse_commit("").is_none());
+    }
+
+    #[test]
+    fn diff_headers_are_optional() {
+        let diff = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/y.rs b/y.rs\n@@ -1 +1 @@\n-c\n+d\n";
+        assert_eq!(parse_diff(diff, false).len(), 4);
+        let with = parse_diff(diff, true);
+        assert_eq!(with.len(), 6);
+        assert_eq!(with[0].kind, LineKind::Note);
+    }
+
+    #[test]
+    fn tab_labels_fit_in_the_left_box() {
+        for mode in TABS {
+            let total: usize = tab_specs(mode, 150)
+                .iter()
+                .map(|(_, l)| l.chars().count())
+                .sum::<usize>()
+                + 9
+                + 5;
+            assert!(total <= 38, "{} too wide", total);
+        }
     }
 
     #[test]
@@ -1651,8 +2100,8 @@ mod tests {
 
     #[test]
     fn layout_requires_minimum_size() {
-        assert!(compute_layout(40, 10, 0).is_none());
-        let l = compute_layout(100, 30, 3).unwrap();
+        assert!(compute_layout(40, 10, Mode::Changes, 0).is_none());
+        let l = compute_layout(100, 30, Mode::Changes, 3).unwrap();
         assert_eq!(l.left_w + l.right_w, 100);
         assert_eq!(l.box_h, 25);
     }
