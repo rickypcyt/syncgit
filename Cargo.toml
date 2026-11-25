@@ -1,22 +1,25 @@
 [package]
 name = "syncgit"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+rust-version = "1.70"
 authors = ["Rickypcyt <rickypcyt@gmail.com>"]
-description = "CLI tool to sync git repositories."
+description = "Live terminal UI for git: watch changes, see colored diffs, browse history and branches, then commit and push in one step."
 readme = "README.md"
 license = "MIT"
-repository = "https://github.com/rickypcyt/syncgit.git"
-keywords = ["git", "cli", "sync"]
+repository = "https://github.com/rickypcyt/syncgit"
+homepage = "https://github.com/rickypcyt/syncgit"
+documentation = "https://github.com/rickypcyt/syncgit#readme"
+keywords = ["git", "tui", "cli", "source-control", "sync"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["target/*"]
+exclude = ["target/*", "info.txt", ".github/*"]
 
 [dependencies]
-# TUI deps for responsive UI
+# Terminal UI: raw mode, colors, mouse and keyboard events
 crossterm = "0.27"
-# HTTP client for GitHub API
+# HTTP client for the GitHub API (repo creation, connectivity check)
 reqwest = { version = "0.11", features = ["json", "blocking"] }
-# JSON serialization/deserialization
+# JSON handling for GitHub API payloads
 serde_json = "1.0"
 
 [profile.release]

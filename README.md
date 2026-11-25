@@ -1,110 +1,132 @@
----
-# 🛠️ syncgit — Git Sync CLI (v0.3.0)
+# 🛠️ syncgit
 
-A lightweight Rust-based CLI to streamline everyday Git workflows with enhanced safety and user experience. Automatically detects repository context, provides clear status, and guides you through the commit and sync process with intuitive prompts.
+[![Crates.io](https://img.shields.io/crates/v/syncgit.svg)](https://crates.io/crates/syncgit)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 🚀 What's New in v0.3.0
+**A live terminal UI for git.** Run `syncgit` inside any repository and it watches your files in real time: edit something and it shows up instantly, with the changes in green and red right inside the code. Type a message, press `Enter`, and your work is staged, committed and pushed.
 
-- 🛡️ **Safer Push Workflow**: Added explicit confirmation before pushing changes
-- 🔄 **Improved Sync**: Better handling of remote changes with clear prompts
-- 🌍 **Fully Internationalized**: All user-facing messages now in English
-- 🎯 **More Precise**: Better detection of repository state and changes
-- 🛠️ **Bug Fixes**: Various stability improvements and edge case handling
+Think of it as the Source Control panel of VS Code, but in your terminal and one keystroke away.
 
-## 📋 Features
+```
+ syncgit  my-project  ⎇ main  ↑1
+┌─ Changes (3) │ Files │ Log │ Br ────────┐┌─ src/main.rs ────────────────────────────┐
+│ M src/main.rs                           ││   12   let total = 1;                    │
+│ U src/watch.rs                          ││   13 - let name = "a";        (red)      │
+│ D old.txt                               ││   13 + let name = "b";        (green)    │
+└─────────────────────────────────────────┘└──────────────────────────────────────────┘
+┌─ Commit message ─────────────────────────────────────────────────────────────────────┐
+│ › Add branch switching                                                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+ ↑↓ select · Tab next tab · ←→ fold · PgUp/PgDn scroll · Enter commit+push · Esc quit
+```
 
-- 🔍 Auto-detects the repository root (`.git`)
-- 🧭 Context-aware: Shows repository root and current subpath
-- 📊 Clear status overview with color-coded output
-- 📂 Subpath-aware operations for precise changes
-- ⏯️ Interactive workflow with clear prompts at each step
-- 🔄 Smart sync that handles both push and pull scenarios
-- 🔒 Secure credential handling with GitHub token support
-- 🌐 Offline-friendly with clear status indicators
-- 🧭 Works from any subdirectory within a repository
+## ✨ Features
 
-All path-sensitive `git` operations use `git -C <repo_root>` for robust behavior regardless of where you run `syncgit`.
+- ⚡ **Real time**: the file list updates by itself; with nothing to commit it shows *All set, nothing to commit*.
+- 🎨 **Code viewer with diffs**: whole files with added lines in green and removed lines in red, with line numbers. New files are all green.
+- 🗂️ **Four tabs**, switch with `Tab` or the mouse:
+  - **Changes**: modified, new, deleted and renamed files.
+  - **Files**: a VS Code-style explorer (folders first, collapsible, respects `.gitignore`).
+  - **Log**: the last 300 commits; select one to see its author, date, message and full colored diff.
+  - **Branches**: local and remote branches, with the current one marked; switch with `Enter`.
+- 🚀 **One-step commit & push**: type a message, press `Enter`.
+- 🖱️ **Keyboard and mouse**: click files and tabs, scroll with the wheel (it accelerates when you scroll fast).
+- 🧵 **Never freezes**: all git work runs on a background thread, so the UI stays responsive even during a push.
+- 🔒 **Safe token handling**: your GitHub token is passed to git for a single command and never written to disk.
+- 🌐 **Offline friendly**: commits are saved locally and the error is shown if the push fails.
+- 🧭 **Classic mode** (`--classic`): the original step-by-step prompt flow, including creating a new GitHub repository.
 
 ## 🛠️ Installation
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) (latest stable version recommended)
-- Git 2.0 or later
+- [Rust](https://www.rust-lang.org/tools/install) 1.70 or later
+- Git 2.23 or later (uses `git switch`)
+- A terminal of at least **70×12** with truecolor support (Windows Terminal, iTerm2, Alacritty, kitty, VS Code terminal, ...)
+- **Windows**: the MSVC linker, i.e. [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with the *Desktop development with C++* workload
 
-### Install from crates.io
+### From crates.io
 
 ```bash
 cargo install syncgit
 ```
 
-### Build from source
+### From source
 
 ```bash
-git clone https://github.com/rickypcyt/syncgit-rustcli.git
+git clone https://github.com/rickypcyt/syncgit.git
 cd syncgit
 cargo install --path .
 ```
 
-### GitHub Token (for private repositories)
-
-To work with private repositories, set your GitHub token:
+### Update
 
 ```bash
-export GITHUB_TOKEN=your_github_token_here
-# Add to your shell's rc file to make it persistent
+cargo install syncgit --force
 ```
 
-## 🚀 Basic Usage
+## 🚀 Usage
 
-Run the tool from any directory within a Git repository:
+Run it from any folder inside a git repository:
 
 ```bash
-syncgit
+syncgit            # live view (default)
+syncgit --classic  # step-by-step prompts (alias: -c)
 ```
 
-The tool will guide you through:
-1. Reviewing changes
-2. Staging files
-3. Committing with a message
-4. Syncing with remote (if needed)
+If the folder is not a repository, `syncgit` offers to initialize one (classic flow).
 
-1) Info header: `Repository root` and `Subpath`.
-2) Global short status.
-3) Check pending pushes; optionally push first.
-4) Pull changes.
-5) Local changes check; show subpath-only grouped status.
-6) Stage only current subpath (idempotent if already staged).
-7) Pause: press Enter → ask for commit message.
-8) Commit and push.
-
-### Subpath grouping (visual aid)
-
-When you’re in a parent folder with multiple projects, the subpath status is grouped by top-level folder. This keeps large changes readable and helps you focus on a particular folder’s changes when committing from the parent.
-
-## ⚡ Watch mode (default)
-
-Running `syncgit` opens a live, VS Code–style source control view. It shows "All set, nothing to commit" and lists modified, new and deleted files as soon as they change. Type a commit message and press:
-
-The screen is split into boxes flush to the left: a **Changes / Files** list on the left and a **code viewer** on the right. The viewer shows the whole file with additions in green and removals in red (new files are all green; unchanged files in the Files explorer show plain code). Everything works with the keyboard or the mouse (click files and tabs, scroll with the wheel).
+### Keys
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | Select previous / next file |
-| `Tab` | Switch between Changes and the Files explorer |
-| `←` / `→` | Collapse / expand the selected folder |
-| `PgUp` / `PgDn`, `Home` / `End` | Scroll the viewer |
-| `Enter` | Stage everything, commit and push (needs a message) |
-| `Ctrl+S` | Commit only |
+| `↑` / `↓` | Select the previous / next item in the list |
+| `Tab` | Next tab: Changes → Files → Log → Branches |
+| `←` / `→` | Collapse / expand the selected folder (Files tab) |
+| `PgUp` / `PgDn` | Scroll the viewer one page |
+| `Home` / `End` | Jump to the top / bottom of the viewer |
+| *type text* | Write the commit message |
+| `Enter` | Commit and push everything (when there is a message) |
+| `Enter` | On **Branches**, with an empty message: switch to the selected branch |
+| `Enter` | On a folder, with an empty message: collapse / expand it |
+| `Ctrl+S` | Commit only (no push) |
 | `Ctrl+P` | Push |
-| `Ctrl+L` | Pull (rebase + autostash) |
-| `Esc` | Clear the message / quit |
+| `Ctrl+L` | Pull (`--rebase --autostash`) |
+| `Ctrl+U` | Clear the message |
+| `Esc` | Clear the message, or quit if it is already empty |
+| `Ctrl+C` | Quit |
 
-Use `syncgit --classic` for the previous step-by-step flow.
+### Mouse
+
+- Click a tab title to switch tabs.
+- Click a file, commit or branch to select it. Clicking a folder collapses or expands it.
+- Use the wheel over the left box to scroll the list and over the right box to scroll the viewer.
+- Hold `Shift` while dragging to select text in most terminals.
+
+### Colors
+
+| Mark | Meaning |
+| --- | --- |
+| `U` green | New (untracked) file |
+| `A` green | Added to the index |
+| `M` yellow | Modified |
+| `D` red | Deleted |
+| `R` / `C` cyan | Renamed / copied |
+| `↑n` yellow | Commits ahead of the remote |
+| `↓n` red | Commits behind the remote |
+
+## 🔐 GitHub authentication
+
+- **SSH remotes** (`git@github.com:...`) work out of the box with your SSH keys.
+- **HTTPS remotes** use your configured credential helper, or a token from any of `GITHUB_TOKEN`, `GH_TOKEN` or `GIT_TOKEN`:
+
+```bash
+export GITHUB_TOKEN=your_token_here   # add it to your shell rc file to keep it
+```
+
+The token is passed to git through a process-local HTTP header. It is never written to `.git/config` or `.git/credentials`. Git is also run with `GIT_TERMINAL_PROMPT=0`, so it can never hang waiting for a password inside the UI.
 
 ## 🧪 Development
-
-Run the local quality checks with:
 
 ```bash
 cargo fmt -- --check
@@ -112,51 +134,50 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The application is organized into Git workflow code in `src/main.rs`, terminal UI helpers in `src/ui.rs`, structured errors in `src/error.rs`, and unit tests in `src/tests.rs`.
+Project layout:
 
-## 🌐 Offline Mode
+| File | Purpose |
+| --- | --- |
+| `src/main.rs` | Entry point, git helpers and the classic step-by-step flow |
+| `src/watch.rs` | The live UI: worker thread, tabs, viewer, rendering, input |
+| `src/ui.rs` | Colored output and prompts for classic mode |
+| `src/error.rs` | Structured error type |
+| `src/tests.rs` | Unit tests for the core helpers |
 
-If no internet connection is detected, changes are committed locally but not pushed. A message will inform you to push manually once online.
-
-## 🔐 GitHub Token Authentication
-
-To push to private GitHub repositories via HTTPS, the tool can use the `GITHUB_TOKEN`, `GH_TOKEN`, or `GIT_TOKEN` environment variable. The token is passed to Git through a process-local HTTP authorization header and is not written to `.git/config` or `.git/credentials`.
-
-## 📦 Update to latest version
-
-- Update this CLI:
-
-```sh
-cargo install syncgit --force
-```
-
-- Or manage binaries with cargo-update:
-
-```sh
-cargo install cargo-update
-cargo install-update -a
-```
+How the live view works: a background worker polls `git status` every second and refreshes the active tab's list every few seconds. The UI thread never runs git; it only draws, redrawing just the lines that changed, and reads keys and mouse events.
 
 ## 📎 Dependencies
 
-- [`crossterm`](https://crates.io/crates/crossterm): Terminal size detection and UI helpers.
-- [`reqwest`](https://crates.io/crates/reqwest): GitHub API HTTP client.
-- [`serde_json`](https://crates.io/crates/serde_json): GitHub API payload handling.
-- Standard Rust `std::process`, `std::io`, `std::env`, and `std::net`.
+- [`crossterm`](https://crates.io/crates/crossterm): raw terminal, colors, keyboard and mouse events.
+- [`reqwest`](https://crates.io/crates/reqwest): GitHub API client (repository creation, connectivity check).
+- [`serde_json`](https://crates.io/crates/serde_json): GitHub API payloads.
 
 ## 📝 Changelog
 
-- 0.1.6
-  - Grouped subpath status printing for cleaner views in parent folders with many projects.
-  - Staging limited to current subpath; consistent `git -C <root>` usage.
-  - “Press Enter to commit changes…” pause before commit message.
-  - Header simplified: `Repository root` + `Subpath`.
-  - Various UX improvements and clearer outputs.
+### 0.4.0
+- New live view (now the default): real-time changes, boxed layout, code viewer with green/red diffs.
+- New tabs: **Files** explorer, **Log** (commit history with diffs) and **Branches** (list and switch).
+- Mouse support, with accelerated wheel scrolling.
+- Commit, push and pull run in the background; the UI never blocks.
+- Redraws only the lines that changed; far less flicker.
+- Left-aligned, colored classic mode (`--classic`).
+- Package metadata, README and docs refreshed.
 
-## 🤝 Contributions
+### 0.3.0
+- Safer push workflow with explicit confirmation.
+- Token support via `GITHUB_TOKEN`, `GH_TOKEN` or `GIT_TOKEN` without writing it to disk.
+- Code split into modules, structured errors and unit tests.
 
-Pull requests and feedback are welcome! Please open an issue first to discuss any major changes.
+### 0.1.6
+- Grouped subpath status for parent folders with many projects.
+- Staging limited to the current subpath; consistent `git -C <root>` usage.
+
+## 🤝 Contributing
+
+Pull requests and feedback are welcome. Please open an issue first to discuss any major change.
+
+## 📄 License
+
+MIT © Rickypcyt
 
 Made with ❤️ in Rust.
-
----
