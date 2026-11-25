@@ -6,6 +6,9 @@ authors = ["Rickypcyt <rickypcyt@gmail.com>"]
 description = "CLI tool to sync git repositories."
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/rickypcyt/syncgit.git"
+keywords = ["git", "cli", "sync"]
+categories = ["command-line-utilities", "development-tools"]
 exclude = ["target/*"]
 
 [dependencies]

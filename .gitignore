@@ -2,9 +2,6 @@
 target/
 **/target/
 
-# Archivos de lock de Cargo (estos en general se versionan, pero si quieres ignorarlos)
-Cargo.lock
-
 # Archivos temporales y de backup del editor
 *.rs.bk
 *.swp

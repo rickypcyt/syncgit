@@ -1,9 +1,9 @@
 ---
-# 🛠️ syncgit — Git Sync CLI (v0.2.0)
+# 🛠️ syncgit — Git Sync CLI (v0.3.0)
 
 A lightweight Rust-based CLI to streamline everyday Git workflows with enhanced safety and user experience. Automatically detects repository context, provides clear status, and guides you through the commit and sync process with intuitive prompts.
 
-## 🚀 What's New in v0.2.0
+## 🚀 What's New in v0.3.0
 
 - 🛡️ **Safer Push Workflow**: Added explicit confirmation before pushing changes
 - 🔄 **Improved Sync**: Better handling of remote changes with clear prompts
@@ -82,13 +82,25 @@ The tool will guide you through:
 
 When you’re in a parent folder with multiple projects, the subpath status is grouped by top-level folder. This keeps large changes readable and helps you focus on a particular folder’s changes when committing from the parent.
 
+## 🧪 Development
+
+Run the local quality checks with:
+
+```bash
+cargo fmt -- --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The application is organized into Git workflow code in `src/main.rs`, terminal UI helpers in `src/ui.rs`, structured errors in `src/error.rs`, and unit tests in `src/tests.rs`.
+
 ## 🌐 Offline Mode
 
 If no internet connection is detected, changes are committed locally but not pushed. A message will inform you to push manually once online.
 
 ## 🔐 GitHub Token Authentication
 
-To push to private GitHub repositories via HTTPS, the tool will use the `GITHUB_TOKEN` environment variable (if available) to authenticate securely by rewriting the remote URL temporarily.
+To push to private GitHub repositories via HTTPS, the tool can use the `GITHUB_TOKEN`, `GH_TOKEN`, or `GIT_TOKEN` environment variable. The token is passed to Git through a process-local HTTP authorization header and is not written to `.git/config` or `.git/credentials`.
 
 ## 📦 Update to latest version
 
@@ -107,7 +119,9 @@ cargo install-update -a
 
 ## 📎 Dependencies
 
-- [`term_size`](https://crates.io/crates/term_size): For responsive terminal layout.
+- [`crossterm`](https://crates.io/crates/crossterm): Terminal size detection and UI helpers.
+- [`reqwest`](https://crates.io/crates/reqwest): GitHub API HTTP client.
+- [`serde_json`](https://crates.io/crates/serde_json): GitHub API payload handling.
 - Standard Rust `std::process`, `std::io`, `std::env`, and `std::net`.
 
 ## 📝 Changelog
