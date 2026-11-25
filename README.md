@@ -82,6 +82,26 @@ The tool will guide you through:
 
 When you’re in a parent folder with multiple projects, the subpath status is grouped by top-level folder. This keeps large changes readable and helps you focus on a particular folder’s changes when committing from the parent.
 
+## ⚡ Watch mode (default)
+
+Running `syncgit` opens a live, VS Code–style source control view. It shows "Waiting for changes..." and lists modified, new and deleted files as soon as they change. Type a commit message and press:
+
+The screen is split into boxes flush to the left: a **Changes / Files** list on the left and a **code viewer** on the right. The viewer shows the whole file with additions in green and removals in red (new files are all green; unchanged files in the Files explorer show plain code). Everything works with the keyboard or the mouse (click files and tabs, scroll with the wheel).
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Select previous / next file |
+| `Tab` | Switch between Changes and the Files explorer |
+| `←` / `→` | Collapse / expand the selected folder |
+| `PgUp` / `PgDn`, `Home` / `End` | Scroll the viewer |
+| `Enter` | Stage everything, commit and push (needs a message) |
+| `Ctrl+S` | Commit only |
+| `Ctrl+P` | Push |
+| `Ctrl+L` | Pull (rebase + autostash) |
+| `Esc` | Clear the message / quit |
+
+Use `syncgit --classic` for the previous step-by-step flow.
+
 ## 🧪 Development
 
 Run the local quality checks with:

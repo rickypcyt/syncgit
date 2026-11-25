@@ -10,6 +10,7 @@ mod error;
 #[cfg(test)]
 mod tests;
 mod ui;
+mod watch;
 
 use error::{GitError, Result};
 use ui::UI;
@@ -438,17 +439,16 @@ fn print_grouped_status(repo: &GitRepo, pathspec: &str) {
     }
 
     if groups.is_empty() {
-        println!("{}", UI::center_text("🟢 No changes in current subpath"));
+        println!("{}", UI::line("🟢 No changes in current subpath"));
         return;
     }
 
     for (group, items) in groups {
         let display_name = if group == "." { "(root)" } else { &group };
-        println!("{}", UI::center_text(&format!("📁 {}", display_name)));
+        println!("{}", UI::line(&format!("📁 {}", display_name)));
         for item in items {
-            println!("{}", item);
+            UI::status_entry(&item);
         }
-        UI::print_separator();
     }
 }
 
@@ -472,14 +472,13 @@ fn compute_pathspec(repo_root: &Path, current: &Path) -> String {
 }
 
 fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
-    UI::print_separator();
-    println!("{}", UI::center_text("📄 Changes to be staged:"));
+    UI::section("📄 Changes to be staged");
     print_grouped_status(repo, pathspec);
 
     if !repo.has_changes(Some(pathspec)) {
         println!(
             "{}",
-            UI::center_text("🟢 No changes to add in the current folder")
+            UI::line("🟢 No changes to add in the current folder")
         );
         return Err(GitError::NoChanges);
     }
@@ -487,11 +486,11 @@ fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
     // Ask for confirmation before staging
     println!(
         "\n{}",
-        UI::center_text("Press Enter to stage these changes, or Ctrl+C to cancel...")
+        UI::line("Press Enter to stage these changes, or Ctrl+C to cancel...")
     );
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
-        println!("\n{}", UI::center_text("❌ Operation cancelled"));
+        println!("\n{}", UI::line("❌ Operation cancelled"));
         return Err(GitError::CommandFailed(
             "User cancelled the operation".into(),
         ));
@@ -499,9 +498,9 @@ fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
 
     // Stage changes
     // Use -- to prevent pathspec from being interpreted as an option
-    println!("\n{}", UI::center_text("⏳ Staging changes..."));
+    println!("\n{}", UI::line("⏳ Staging changes..."));
     repo.run_command(&["add", "--", pathspec])?;
-    println!("{}", UI::center_text("✅ Changes added"));
+    println!("{}", UI::line("✅ Changes added"));
 
     // Verify staged changes exist
     let has_staged = Command::new("git")
@@ -517,37 +516,36 @@ fn stage_and_commit(repo: &GitRepo, pathspec: &str) -> Result<()> {
         .unwrap_or(false);
 
     if !has_staged {
-        println!("{}", UI::center_text("ℹ️  There's nothing to commit"));
+        println!("{}", UI::line("ℹ️  There's nothing to commit"));
         println!(
             "{}",
-            UI::center_text("   All changes are already committed")
+            UI::line("   All changes are already committed")
         );
         return Err(GitError::NoChanges);
     }
 
     // Show staged changes
-    UI::print_separator();
-    println!("{}", UI::center_text("📝 Staged changes to be committed:"));
+    UI::section("📝 Staged changes to be committed");
     repo.run_command(&["diff", "--cached", "--stat"])?;
 
     // Ask for confirmation before committing
     println!(
         "\n{}",
-        UI::center_text("Press Enter to commit these changes, or any other key to cancel")
+        UI::line("Press Enter to commit these changes, or any other key to cancel")
     );
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() || !input.trim().is_empty() {
-        println!("\n{}", UI::center_text("❌ Commit cancelled"));
+        println!("\n{}", UI::line("❌ Commit cancelled"));
         return Err(GitError::CommandFailed("User cancelled the commit".into()));
     }
 
-    UI::print_separator();
-    let message = UI::prompt_input("Enter commit message (or leave empty to cancel)");
+    println!();
+    let message = UI::prompt_input("Commit message (empty to cancel)");
 
     if message.trim().is_empty() {
         println!(
             "\n{}",
-            UI::center_text("❌ Commit cancelled - no message provided")
+            UI::line("❌ Commit cancelled - no message provided")
         );
         return Err(GitError::NoCommitMessage);
     }
@@ -600,7 +598,7 @@ fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
     if has_stash {
         println!(
             "{}",
-            UI::center_text("⚠️  Warning: You have stashed changes")
+            UI::line("⚠️  Warning: You have stashed changes")
         );
         if !UI::prompt_yes_no("Do you want to continue anyway?") {
             return Err(GitError::CommandFailed(
@@ -615,52 +613,50 @@ fn check_git_conflicts(repo: &GitRepo) -> Result<()> {
 fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
     // First check for any conflicts or problematic states
     if let Err(e) = check_git_conflicts(repo) {
-        println!("\n{}", UI::center_text(" Verification error:"));
-        println!("{}\n", UI::center_text(&e.to_string()));
+        println!("\n{}", UI::line(" Verification error:"));
+        println!("{}\n", UI::line(&e.to_string()));
         return Err(e);
     }
 
     let (ahead, _) = repo.get_ahead_behind_count();
 
     if ahead == 0 {
-        println!("{}", UI::center_text(" No pending commits to push"));
-        UI::print_separator();
         return Ok(());
     }
 
     println!(
         "{}",
-        UI::center_text(" WARNING: You have commits that need to be pushed")
+        UI::line(" WARNING: You have commits that need to be pushed")
     );
     println!(
         "{}",
-        UI::center_text(&format!("   {} commits ahead of remote repository", ahead))
+        UI::line(&format!("   {} commits ahead of remote repository", ahead))
     );
     println!(
         "{}",
-        UI::center_text("   This could cause conflicts or duplicate commits.")
+        UI::line("   This could cause conflicts or duplicate commits.")
     );
     UI::print_separator();
 
     if !UI::prompt_yes_no("Do you want to push the existing commits first?") {
         println!(
             "{}",
-            UI::center_text("⚠️  Continuing with the new commit without pushing changes...")
+            UI::line("⚠️  Continuing with the new commit without pushing changes...")
         );
         UI::print_separator();
         return Ok(());
     }
 
-    println!("{}", UI::center_text("⬆️  Pushing existing commits..."));
+    println!("{}", UI::line("⬆️  Pushing existing commits..."));
 
     if !check_internet_connection() {
         println!(
             "{}",
-            UI::center_text("⚠️  No internet connection. Cannot push existing commits.")
+            UI::line("⚠️  No internet connection. Cannot push existing commits.")
         );
         println!(
             "{}",
-            UI::center_text("    Please resolve this before making new commits.")
+            UI::line("    Please resolve this before making new commits.")
         );
         return Err(GitError::NoInternet);
     }
@@ -671,7 +667,7 @@ fn handle_pending_pushes(repo: &GitRepo) -> Result<()> {
 
     println!(
         "{}",
-        UI::center_text("✅ Existing commits pushed successfully!")
+        UI::line("✅ Existing commits pushed successfully!")
     );
     UI::print_separator();
 
@@ -738,9 +734,9 @@ fn initialize_git_repo(path: &Path) -> Result<GitRepo> {
     // Check if there are any changes to commit
     if repo.has_changes(None) {
         repo.run_command(&["commit", "-m", "Initial commit"])?;
-        println!("\n✅ Created initial commit");
+        UI::success("Created initial commit");
     } else {
-        println!("\nℹ️  No files to commit in the initial repository");
+        UI::info("No files to commit in the initial repository");
     }
 
     Ok(repo)
@@ -762,7 +758,7 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
     // Ask for repository name with default
     let repo_name = loop {
         let input_name = UI::prompt_input(&format!(
-            "Enter GitHub repository name [{}]: ",
+            "GitHub repository name [{}]",
             default_repo_name
         ));
         let repo_name = if input_name.trim().is_empty() {
@@ -773,29 +769,26 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
 
         // Validate repository name (GitHub requirements: alphanumeric, -, _, and . only)
         if repo_name.is_empty() {
-            println!(
-                "{}",
-                UI::center_text("❌ Repository name cannot be empty. Please try again.")
-            );
+            UI::error("Repository name cannot be empty. Please try again.");
             continue;
         }
         if !repo_name
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
         {
-            println!("{}", UI::center_text("❌ Repository name can only contain alphanumeric characters, hyphens, underscores, and dots. Please try again."));
+            UI::error("Repository name can only contain alphanumeric characters, hyphens, underscores, and dots. Please try again.");
             continue;
         }
         break repo_name;
     };
 
     // Ask for description
-    let description = UI::prompt_input("Enter repository description (optional): ");
+    let description = UI::prompt_input("Repository description (optional)");
 
     // Ask if should be private
     let is_private = UI::prompt_yes_no("Should this repository be private?");
 
-    println!("\n{}", UI::center_text("🔄 Creating GitHub repository..."));
+    UI::section("🔄 Creating GitHub repository...");
 
     // Create repository using GitHub API
     let client = reqwest::blocking::Client::new();
@@ -825,13 +818,7 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
 
         // Check if repository already exists (422 status with "already exists" message)
         if status == 422 && error_msg.contains("already exists") {
-            println!(
-                "\n{}",
-                UI::center_text(&format!(
-                    "⚠️  Repository '{}' already exists on GitHub",
-                    repo_name
-                ))
-            );
+            UI::warn(&format!("Repository '{}' already exists on GitHub", repo_name));
             if UI::prompt_yes_no("Do you want to use the existing repository and push to it?") {
                 // Get GitHub username from API
                 let username = client
@@ -872,19 +859,13 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
                     .map(|b| b.trim().to_string())
                     .unwrap_or_else(|_| "main".to_string());
 
-                println!(
-                    "\n{}",
-                    UI::center_text("🚀 Pushing to existing GitHub repository...")
-                );
+                UI::section("🚀 Pushing to existing GitHub repository...");
                 repo.configure_auth_remote()?;
                 repo.run_command(&["push", "-u", "origin", &branch])?;
-                println!(
-                    "\n{}",
-                    UI::center_text(&format!(
-                        "✅ Successfully pushed to GitHub repository: {}",
-                        existing_repo_url
-                    ))
-                );
+                UI::success(&format!(
+                    "Successfully pushed to GitHub repository: {}",
+                    existing_repo_url
+                ));
                 return Ok(());
             } else {
                 return Err(GitError::Other(
@@ -938,9 +919,9 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
     // Add remote origin
     if let Err(e) = repo.run_command(&["remote", "add", "origin", clone_url]) {
         if let Ok(output) = repo.run_command_with_output(&["remote", "get-url", "origin"]) {
-            println!("ℹ️  Remote 'origin' already exists: {}", output.trim());
+            UI::info(&format!("Remote 'origin' already exists: {}", output.trim()));
             if !UI::prompt_yes_no("Do you want to update the existing remote URL?") {
-                println!("\n⚠️  Using existing remote. You may need to manually set up tracking.");
+                UI::warn("Using existing remote. You may need to manually set up tracking.");
                 return Ok(());
             }
             repo.run_command(&["remote", "set-url", "origin", clone_url])?;
@@ -957,7 +938,7 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
 
     if !has_commits {
         let commit_message = UI::prompt_input(
-            "Enter initial commit message (or press Enter for 'Initial commit'): ",
+            "Initial commit message (Enter for 'Initial commit')",
         );
         let commit_message = if commit_message.trim().is_empty() {
             "Initial commit"
@@ -970,34 +951,34 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
 
         // Create initial commit
         repo.run_command(&["commit", "-m", commit_message])?;
-        println!(
-            "\n✅ Created initial commit with message: {}",
+        UI::success(&format!(
+            "Created initial commit with message: {}",
             commit_message
-        );
+        ));
     }
 
-    println!("\n🚀 Pushing to GitHub repository...");
+    UI::section("🚀 Pushing to GitHub repository...");
 
     // First, try to push with -u (which sets upstream)
     match repo.run_command(&["push", "-u", "origin", &branch]) {
         Ok(_) => {
-            println!(
-                "\n✅ Successfully pushed to GitHub repository: {}",
+            UI::success(&format!(
+                "Successfully pushed to GitHub repository: {}",
                 repo_url
-            );
+            ));
             Ok(())
         }
         Err(e) => {
-            println!("\n⚠️  Failed to push to remote repository: {}", e);
+            UI::warn(&format!("Failed to push to remote repository: {}", e));
 
             // Try to fetch first in case the remote has changes
-            println!("\n🔄 Fetching from remote...");
+            UI::section("🔄 Fetching from remote...");
             if let Err(e) = repo.run_command(&["fetch"]) {
-                println!("⚠️  Failed to fetch from remote: {}", e);
+                UI::warn(&format!("Failed to fetch from remote: {}", e));
             }
 
             // Try to set up tracking with a more robust approach
-            println!("\n🔗 Setting up tracking...");
+            UI::section("🔗 Setting up tracking...");
 
             // Create commands with proper references to branch
             let branch_ref = branch.as_str();
@@ -1023,16 +1004,16 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
             for (cmd, args) in setup_commands.iter() {
                 let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                 if let Err(e) = repo.run_command(&args_refs) {
-                    println!("⚠️  Command failed: git {} {}", cmd, args.join(" "));
-                    println!("   Error: {}", e);
+                    UI::warn(&format!("Command failed: git {} {}", cmd, args.join(" ")));
+                    println!("    Error: {}", e);
                 }
             }
 
             // Final attempt to push
             if UI::prompt_yes_no("Would you like to try pushing again?") {
                 if let Err(e) = repo.run_command(&["push"]) {
-                    println!("\n❌ Final push attempt failed: {}", e);
-                    println!("\nYou may need to manually set up tracking with these commands:");
+                    UI::error(&format!("Final push attempt failed: {}", e));
+                    UI::info("You may need to manually set up tracking with these commands:");
                     println!(
                         "  git branch --set-upstream-to=origin/{} {}",
                         branch, branch
@@ -1042,7 +1023,7 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
                         "Failed to push to remote repository".to_string(),
                     ));
                 } else {
-                    println!("\n✅ Successfully pushed to GitHub repository!");
+                    UI::success("Successfully pushed to GitHub repository!");
                     return Ok(());
                 }
             }
@@ -1062,11 +1043,11 @@ fn create_github_repo(repo: &GitRepo) -> Result<()> {
 fn print_token_setup_instructions() {
     println!(
         "{}",
-        UI::center_text("❌ No GitHub token found in the environment")
+        UI::line("❌ No GitHub token found in the environment")
     );
     println!(
         "{}",
-        UI::center_text("   Please set it up before continuing:")
+        UI::line("   Please set it up before continuing:")
     );
     println!();
     println!("   1. Create a Personal Access Token in GitHub with 'repo' scope");
@@ -1085,23 +1066,23 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
     let (ahead, behind) = repo.get_ahead_behind_count();
 
     if ahead > 0 {
-        println!("\n{}", UI::center_text("⚠️  You have unpushed changes:"));
+        println!("\n{}", UI::line("⚠️  You have unpushed changes:"));
         println!("{} commits ahead of remote", ahead);
 
         if check_internet_connection() {
             println!(
                 "\n{}",
-                UI::center_text("Press Enter to push changes, or Ctrl+C to cancel")
+                UI::line("Press Enter to push changes, or Ctrl+C to cancel")
             );
             if UI::wait_for_enter() {
                 repo.configure_auth_remote()?;
                 repo.run_command(&["push"])?;
-                println!("{}", UI::center_text("✅ Changes pushed successfully!"));
+                println!("{}", UI::line("✅ Changes pushed successfully!"));
             }
         } else {
             println!(
                 "{}",
-                UI::center_text("ℹ️  No internet connection. Changes will remain local for now.")
+                UI::line("ℹ️  No internet connection. Changes will remain local for now.")
             );
         }
     }
@@ -1109,22 +1090,22 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
     if behind > 0 {
         println!(
             "\n{}: {} commits behind remote",
-            UI::center_text("⚠️  Your local branch is behind"),
+            UI::line("⚠️  Your local branch is behind"),
             behind
         );
 
         if check_internet_connection() {
             println!(
                 "\n{}",
-                UI::center_text(&format!("You have {} commits to sync from remote", behind))
+                UI::line(&format!("You have {} commits to sync from remote", behind))
             );
             println!(
                 "{}",
-                UI::center_text("Press Enter to view and sync these changes, or Ctrl+C to cancel")
+                UI::line("Press Enter to view and sync these changes, or Ctrl+C to cancel")
             );
 
             if !UI::wait_for_enter() {
-                println!("\n{}", UI::center_text("❌ Sync cancelled"));
+                println!("\n{}", UI::line("❌ Sync cancelled"));
                 return Ok(());
             }
 
@@ -1139,20 +1120,20 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
                 "5",
                 "--no-merges",
             ]) {
-                println!("\n{}", UI::center_text("Latest changes to sync:"));
+                println!("\n{}", UI::line("Latest changes to sync:"));
                 println!("{}", output);
             }
 
             println!(
                 "\n{}",
-                UI::center_text("Press Enter to confirm sync, or Ctrl+C to cancel")
+                UI::line("Press Enter to confirm sync, or Ctrl+C to cancel")
             );
             if !UI::wait_for_enter() {
-                println!("\n{}", UI::center_text("❌ Sync cancelled"));
+                println!("\n{}", UI::line("❌ Sync cancelled"));
                 return Ok(());
             }
 
-            println!("\n{}", UI::center_text("🔄 Syncing changes..."));
+            println!("\n{}", UI::line("🔄 Syncing changes..."));
 
             // Rebase local commits onto the fetched upstream and let Git
             // autostash uncommitted changes without discarding them.
@@ -1161,16 +1142,9 @@ fn check_sync_status(repo: &GitRepo) -> Result<()> {
         } else {
             println!(
                 "\n{}",
-                UI::center_text("ℹ️  No internet connection. Working with local version for now.")
+                UI::line("ℹ️  No internet connection. Working with local version for now.")
             );
         }
-    }
-
-    if ahead == 0 && behind == 0 {
-        println!(
-            "\n{}",
-            UI::center_text("✅ Your repository is in sync with remote")
-        );
     }
 
     Ok(())
@@ -1200,16 +1174,16 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 UI::print_separator();
                 if UI::prompt_yes_no("Do you want to create a GitHub repository and push to it?") {
                     if let Err(e) = create_github_repo(&new_repo) {
-                        println!("\n{}: {}", UI::center_text("⚠️  Warning"), e);
+                        println!("\n{}: {}", UI::line("⚠️  Warning"), e);
                         println!(
                             "{}",
-                            UI::center_text("You can create the repository manually later.")
+                            UI::line("You can create the repository manually later.")
                         );
                         UI::print_separator();
                     } else {
                         println!(
                             "\n{}",
-                            UI::center_text("✅ Repository created and pushed to GitHub!")
+                            UI::line("✅ Repository created and pushed to GitHub!")
                         );
                         UI::print_separator();
                         return Ok(());
@@ -1224,18 +1198,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Check sync status at startup
-    if let Err(e) = check_sync_status(&repo) {
-        println!("\n{}: {}", UI::center_text("⚠️  Warning"), e);
-        // Continue execution even if sync check fails
+    // Default: real-time watch mode. Use `syncgit --classic` for the step-by-step flow.
+    if !env::args().skip(1).any(|a| a == "--classic" || a == "-c") {
+        watch::run(&repo)?;
+        return Ok(());
     }
 
-    UI::print_separator();
-    println!(
-        "{}",
-        UI::center_text(&format!("📁 Repository root: {}", repo.name))
-    );
-    UI::print_separator();
+    // Check sync status at startup
+    if let Err(e) = check_sync_status(&repo) {
+        println!("\n{}: {}", UI::line("⚠️  Warning"), e);
+        // Continue execution even if sync check fails
+    }
 
     let pathspec = compute_pathspec(&repo.root, &current_dir);
     let subpath_display = if pathspec == "." {
@@ -1243,25 +1216,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     } else {
         pathspec.clone()
     };
-    println!(
-        "{}",
-        UI::center_text(&format!("🧭 Subpath: {}", subpath_display))
+    let (ahead, behind) = repo.get_ahead_behind_count();
+    UI::header(
+        &repo.name,
+        &repo.get_branch(),
+        &subpath_display,
+        ahead,
+        behind,
     );
-    UI::print_separator();
-
-    // Show status
-    println!("{}", UI::center_text("🔍 Repository status:"));
-    // Status is safe as it doesn't use user input
-    repo.run_command(&["status", "--short", "--branch"])?;
-    UI::print_separator();
 
     // Check pending pushes
-    println!("{}", UI::center_text("🔍 Checking for pending pushes..."));
     handle_pending_pushes(&repo)?;
 
     // Pull only if remote exists
     if repo.has_remote() {
-        println!("{}", UI::center_text("⬇️  Pulling changes..."));
+        println!("{}", UI::line("⬇️  Pulling changes..."));
         // Pull is safe as it doesn't directly use user input
         if let Err(e) = repo.run_command(&["pull"]) {
             // If pull fails due to no upstream, that's okay for new repos
@@ -1273,17 +1242,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             // Otherwise, just continue
         }
-        UI::print_separator();
     } else {
-        println!(
-            "{}",
-            UI::center_text("ℹ️  No remote configured. Skipping pull.")
-        );
-        UI::print_separator();
+        UI::info("No remote configured. Skipping pull.");
     }
 
     // Check for changes
-    println!("{}", UI::center_text("📦 Checking local changes..."));
 
     let all_changes = repo.has_changes(None);
     let current_changes = repo.has_changes(Some(&pathspec));
@@ -1291,15 +1254,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if all_changes && !current_changes {
         println!(
             "{}",
-            UI::center_text("ℹ️  No changes detected in the current folder")
+            UI::line("ℹ️  No changes detected in the current folder")
         );
         println!(
             "{}",
-            UI::center_text("   However, there are pending changes elsewhere in the repository.")
+            UI::line("   However, there are pending changes elsewhere in the repository.")
         );
         println!(
             "{}",
-            UI::center_text(
+            UI::line(
                 "   Tip: run this tool from the repo root or navigate to the folder with changes."
             )
         );
@@ -1314,23 +1277,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Ask for confirmation before pushing
         println!(
             "\n{}",
-            UI::center_text("⚠️  You're about to push your changes to the remote repository.")
+            UI::line("⚠️  You're about to push your changes to the remote repository.")
         );
         println!(
             "{}",
-            UI::center_text("   Press Enter to confirm push, or Ctrl+C to cancel")
+            UI::line("   Press Enter to confirm push, or Ctrl+C to cancel")
         );
 
         if !UI::wait_for_enter() {
-            println!("\n{}", UI::center_text("❌ Push cancelled"));
+            println!("\n{}", UI::line("❌ Push cancelled"));
             return Ok(());
         }
 
-        println!("\n{}", UI::center_text("⬆️  Pushing changes..."));
+        println!("\n{}", UI::line("⬆️  Pushing changes..."));
 
         if !check_internet_connection() {
-            println!("{}", UI::center_text(MSG_NO_INTERNET_PUSH));
-            println!("{}", UI::center_text(MSG_RUN_PUSH_MANUALLY));
+            println!("{}", UI::line(MSG_NO_INTERNET_PUSH));
+            println!("{}", UI::line(MSG_RUN_PUSH_MANUALLY));
             return Ok(());
         }
 
@@ -1338,11 +1301,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         // Ensure push doesn't receive any unwanted parameters
         repo.run_command(&["push"])?;
-        println!("\n{}", UI::center_text("✅ Changes pushed successfully!"));
+        println!("\n{}", UI::line("✅ Changes pushed successfully!"));
     } else {
         println!(
             "\n{}",
-            UI::center_text("ℹ️  No remote configured. Changes committed locally.")
+            UI::line("ℹ️  No remote configured. Changes committed locally.")
         );
         if UI::prompt_yes_no("Do you want to create a GitHub repository and push to it?") {
             create_github_repo(&repo)?;
